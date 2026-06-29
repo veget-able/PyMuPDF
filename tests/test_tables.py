@@ -4,6 +4,7 @@ from pprint import pprint
 import textwrap
 import pickle
 import platform
+from concurrent.futures import ThreadPoolExecutor
 
 import pymupdf
 
@@ -247,6 +248,73 @@ def test_add_lines():
     tab2 = page.find_tables(add_lines=more_lines)[0]
     assert tab2.col_count == 4
     assert tab2.row_count == 5
+
+
+def _make_find_tables_state_doc():
+    doc = pymupdf.open()
+    page = doc.new_page(width=360, height=220)
+    rect = pymupdf.Rect(40, 40, 320, 180)
+    cells = pymupdf.make_table(rect, rows=3, cols=3)
+    for row_index, row in enumerate(cells):
+        for col_index, cell in enumerate(row):
+            page.draw_rect(cell)
+            page.insert_textbox(
+                cell,
+                f"r{row_index}c{col_index}",
+                align=pymupdf.TEXT_ALIGN_CENTER,
+            )
+    return doc.tobytes()
+
+
+def _find_tables_use_layout_false_signature(pdf_bytes):
+    doc = pymupdf.open("pdf", pdf_bytes)
+    try:
+        table = doc[0].find_tables(strategy="lines_strict", use_layout=False)[0]
+        return table.row_count, table.col_count, table.extract()
+    finally:
+        doc.close()
+
+
+def test_find_tables_use_layout_false_does_not_call_get_layout():
+    """use_layout=False must keep find_tables on the pure line-based path."""
+    pdf_bytes = _make_find_tables_state_doc()
+    doc = pymupdf.open("pdf", pdf_bytes)
+    page = doc[0]
+    page_cls = type(page)
+    original_get_layout = page_cls.get_layout
+
+    def fail_get_layout(self, *args, **kwargs):
+        raise AssertionError("get_layout() should not be called")
+
+    page_cls.get_layout = fail_get_layout
+    try:
+        table = page.find_tables(strategy="lines_strict", use_layout=False)[0]
+        assert table.row_count == 3
+        assert table.col_count == 3
+        assert table.extract()[1][1] == "r1c1"
+    finally:
+        page_cls.get_layout = original_get_layout
+        doc.close()
+
+
+def test_find_tables_state_is_call_local_for_threads():
+    """Concurrent find_tables calls must not mix text/vector extraction state."""
+    if platform.python_implementation() == "GraalVM":
+        print("test_find_tables_state_is_call_local_for_threads(): not running because slow on GraalVM.")
+        return
+
+    pdf_bytes = _make_find_tables_state_doc()
+    expected = _find_tables_use_layout_false_signature(pdf_bytes)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(
+            executor.map(
+                lambda _: _find_tables_use_layout_false_signature(pdf_bytes),
+                range(32),
+            )
+        )
+
+    assert results == [expected] * 32
 
 
 def test_3148():
