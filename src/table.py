@@ -77,6 +77,7 @@ import itertools
 import string
 import html
 from collections.abc import Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from operator import itemgetter
 import weakref
@@ -89,8 +90,50 @@ from pymupdf import mupdf
 
 # pylint: disable=no-name-in-module
 
-EDGES = []  # vector graphics from PyMuPDF
-CHARS = []  # text characters from PyMuPDF
+_EDGES_VAR = ContextVar("pymupdf_table_edges", default=None)
+_CHARS_VAR = ContextVar("pymupdf_table_chars", default=None)
+
+
+class _TableStateList:
+    """List-like proxy for per-call table extraction state."""
+
+    def __init__(self, var):
+        self._var = var
+
+    def _list(self):
+        value = self._var.get()
+        if value is None:
+            value = []
+            self._var.set(value)
+        return value
+
+    def append(self, item):
+        return self._list().append(item)
+
+    def clear(self):
+        return self._list().clear()
+
+    def extend(self, items):
+        return self._list().extend(items)
+
+    def __bool__(self):
+        return bool(self._list())
+
+    def __getitem__(self, item):
+        return self._list()[item]
+
+    def __iter__(self):
+        return iter(self._list())
+
+    def __len__(self):
+        return len(self._list())
+
+    def __setitem__(self, key, value):
+        self._list()[key] = value
+
+
+EDGES = _TableStateList(_EDGES_VAR)  # vector graphics from PyMuPDF
+CHARS = _TableStateList(_CHARS_VAR)  # text characters from PyMuPDF
 TEXTPAGE = None  # textpage for cell text extraction
 TEXT_BOLD = mupdf.FZ_STEXT_BOLD
 TEXT_STRIKEOUT = mupdf.FZ_STEXT_STRIKEOUT
@@ -1524,6 +1567,7 @@ class Table:
     def __init__(self, page, cells):
         self.page = page
         self.textpage = None
+        self._chars = None
         self.cells = cells
         self.header = self._get_header()  # PyMuPDF extension
 
@@ -1557,7 +1601,7 @@ class Table:
         return max([len(r.cells) for r in self.rows])
 
     def extract(self, **kwargs) -> list:
-        chars = CHARS
+        chars = self._chars if self._chars is not None else CHARS
         table_arr = []
 
         def char_in_bbox(char, bbox) -> bool:
@@ -2616,8 +2660,11 @@ def find_tables(
     add_lines=None,  # user-specified lines
     add_boxes=None,  # user-specified rectangles
     paths=None,  # accept vector graphics as parameter
+    use_layout: bool = True,  # gate line-based tables by layout table boxes
 ):
     pymupdf._warn_layout_once()
+    _CHARS_VAR.set([])
+    _EDGES_VAR.set([])
     CHARS.clear()
     EDGES.clear()
     TEXTPAGE = None
@@ -2668,22 +2715,20 @@ def find_tables(
 
     old_quad_corrections = pymupdf.TOOLS.unset_quad_corrections()
     try:
-        page.get_layout()
-        if page.layout_information:
-            pymupdf.TOOLS.unset_quad_corrections(True)
-            boxes = [
-                pymupdf.Rect(b[:4]) for b in page.layout_information if b[-1] == "table"
-            ]
-        else:
-            boxes = []
+        boxes = []
+        if use_layout:
+            page.get_layout()
+            if page.layout_information:
+                pymupdf.TOOLS.unset_quad_corrections(True)
+                boxes = [
+                    pymupdf.Rect(b[:4]) for b in page.layout_information if b[-1] == "table"
+                ]
 
-        if boxes:  # layout did find some tables
-            pass
-        elif page.layout_information is not None:
-            # layout was executed but found no tables
-            # make sure we exit quickly with an empty TableFinder
-            tbf = TableFinder(page)
-            return tbf
+            if not boxes and page.layout_information is not None:
+                # layout was executed but found no tables
+                # make sure we exit quickly with an empty TableFinder
+                tbf = TableFinder(page)
+                return tbf
 
         tset = TableSettings.resolve(settings=settings)
         page.table_settings = tset
@@ -2725,6 +2770,8 @@ def find_tables(
         if old_xref is not None:
             page = page_rotation_reset(page, old_xref, old_rot, old_mediabox)
         pymupdf.TOOLS.unset_quad_corrections(old_quad_corrections)
+    chars = list(CHARS)
     for table in tbf.tables:
         table.textpage = TEXTPAGE
+        table._chars = chars
     return tbf
