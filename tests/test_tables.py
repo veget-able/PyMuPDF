@@ -526,3 +526,76 @@ def test_md_styles():
     tabs = page.find_tables()[0]
     text = """|Column 1|Column 2|Column 3|\n|---|---|---|\n|Zelle (0,0)|**Bold (0,1)**|Zelle (0,2)|\n|~~Strikeout (1,0), Zeile 1~~<br>~~Hier kommt Zeile 2.~~|Zelle (1,1)|~~Strikeout (1,2)~~|\n|**`Bold-monospaced`**<br>**`(2,0)`**|_Italic (2,1)_|**_Bold-italic_**<br>**_(2,2)_**|\n|Zelle (3,0)|~~**Bold-strikeout**~~<br>~~**(3,1)**~~|Zelle (3,2)|\n\n"""
     assert tabs.to_markdown() == text
+
+
+def _make_marker_table_doc(marker):
+    """Build a 1-page doc with a small drawn table whose cells embed `marker`."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=360, height=220)
+    rect = pymupdf.Rect(40, 40, 320, 180)
+    cells = pymupdf.make_table(rect, rows=2, cols=2)
+    for row_index, row in enumerate(cells):
+        for col_index, cell in enumerate(row):
+            page.draw_rect(cell)
+            page.insert_textbox(
+                cell,
+                f"{marker}-{row_index}{col_index}",
+                align=pymupdf.TEXT_ALIGN_CENTER,
+            )
+    page.clean_contents()
+    return doc
+
+
+def test_table_extract_stable_after_second_find_tables():
+    """Regression test for the stale-CHARS bug.
+
+    find_tables() snapshots table._chars right after each call so that an
+    already-returned Table's extract() cannot silently pick up a later,
+    unrelated find_tables() call's live (ContextVar-backed) CHARS content.
+    """
+    doc1 = _make_marker_table_doc("PAGE1")
+    doc2 = _make_marker_table_doc("PAGE2")
+    try:
+        table1 = doc1[0].find_tables(strategy="lines_strict")[0]
+        first = table1.extract()
+
+        # An unrelated find_tables() call on a different page/doc resets and
+        # repopulates the shared CHARS state used during text extraction.
+        doc2[0].find_tables(strategy="lines_strict")
+
+        assert table1.extract() == first
+        flat_text = " ".join(cell for row in first for cell in row if cell)
+        assert "PAGE1" in flat_text  # guard against both-empty passes
+        assert "PAGE2" not in flat_text
+    finally:
+        doc1.close()
+        doc2.close()
+
+
+def test_find_tables_use_layout_true_without_layout_is_line_based():
+    """use_layout=True (the default) must gracefully degrade to the pure
+    line-based detection path when the optional layout wheel/model is not
+    available: get_layout() becomes a no-op, page.layout_information stays
+    None, and results must match use_layout=False exactly."""
+    pdf_bytes = _make_find_tables_state_doc()
+    doc = pymupdf.open("pdf", pdf_bytes)
+    page = doc[0]
+    original_get_layout_fn = pymupdf._get_layout
+    pymupdf._get_layout = None  # simulate: pymupdf.layout wheel not installed
+    try:
+        tables_true = page.find_tables(strategy="lines_strict", use_layout=True)
+        assert page.layout_information is None
+
+        tables_false = page.find_tables(strategy="lines_strict", use_layout=False)
+
+        assert len(tables_true.tables) == 1
+        assert [t.extract() for t in tables_true] == [
+            t.extract() for t in tables_false
+        ]
+        table = tables_true[0]
+        assert table.row_count == 3
+        assert table.col_count == 3
+        assert table.extract()[1][1] == "r1c1"
+    finally:
+        pymupdf._get_layout = original_get_layout_fn
+        doc.close()
