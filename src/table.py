@@ -2224,6 +2224,7 @@ page information themselves.
 # -----------------------------------------------------------------------------
 def make_chars(page, clip=None):
     """Extract text as "rawdict" to fill CHARS."""
+    chars = CHARS._list()  # bind once: avoid per-append proxy overhead below
     page_number = page.number + 1
     page_height = page.rect.height
     ctm = page.transformation_matrix
@@ -2278,7 +2279,7 @@ def make_chars(page, clip=None):
                         "y0": bbox_ctm.y0,
                         "y1": bbox_ctm.y1,
                     }
-                    CHARS.append(char_dict)
+                    chars.append(char_dict)
     return TEXTPAGE
 
 
@@ -2288,6 +2289,7 @@ def make_chars(page, clip=None):
 # else to lines.
 # ------------------------------------------------------------------------
 def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes=None):
+    edges = EDGES._list()  # bind once: avoid per-append proxy overhead below
     snap_x = tset.snap_x_tolerance
     snap_y = tset.snap_y_tolerance
     min_length = tset.edge_min_length
@@ -2463,7 +2465,7 @@ def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes
                 p1, p2 = i[1:]
                 line_dict = make_line(p, p1, p2, clip)
                 if line_dict:
-                    EDGES.append(line_to_edge(line_dict))
+                    edges.append(line_to_edge(line_dict))
 
             elif i[0] == "re":
                 # A rectangle: decompose into 4 lines, but filter out
@@ -2478,7 +2480,7 @@ def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes
                     p2 = pymupdf.Point(x, rect.y1)
                     line_dict = make_line(p, p1, p2, clip)
                     if line_dict:
-                        EDGES.append(line_to_edge(line_dict))
+                        edges.append(line_to_edge(line_dict))
                     continue
 
                 if (
@@ -2489,24 +2491,24 @@ def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes
                     p2 = pymupdf.Point(rect.x1, y)
                     line_dict = make_line(p, p1, p2, clip)
                     if line_dict:
-                        EDGES.append(line_to_edge(line_dict))
+                        edges.append(line_to_edge(line_dict))
                     continue
 
                 line_dict = make_line(p, rect.tl, rect.bl, clip)
                 if line_dict:
-                    EDGES.append(line_to_edge(line_dict))
+                    edges.append(line_to_edge(line_dict))
 
                 line_dict = make_line(p, rect.bl, rect.br, clip)
                 if line_dict:
-                    EDGES.append(line_to_edge(line_dict))
+                    edges.append(line_to_edge(line_dict))
 
                 line_dict = make_line(p, rect.br, rect.tr, clip)
                 if line_dict:
-                    EDGES.append(line_to_edge(line_dict))
+                    edges.append(line_to_edge(line_dict))
 
                 line_dict = make_line(p, rect.tr, rect.tl, clip)
                 if line_dict:
-                    EDGES.append(line_to_edge(line_dict))
+                    edges.append(line_to_edge(line_dict))
 
             else:  # must be a quad
                 # we convert it into (up to) 4 lines
@@ -2514,37 +2516,37 @@ def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes
 
                 line_dict = make_line(p, ul, ll, clip)
                 if line_dict:
-                    EDGES.append(line_to_edge(line_dict))
+                    edges.append(line_to_edge(line_dict))
 
                 line_dict = make_line(p, ll, lr, clip)
                 if line_dict:
-                    EDGES.append(line_to_edge(line_dict))
+                    edges.append(line_to_edge(line_dict))
 
                 line_dict = make_line(p, lr, ur, clip)
                 if line_dict:
-                    EDGES.append(line_to_edge(line_dict))
+                    edges.append(line_to_edge(line_dict))
 
                 line_dict = make_line(p, ur, ul, clip)
                 if line_dict:
-                    EDGES.append(line_to_edge(line_dict))
+                    edges.append(line_to_edge(line_dict))
 
     path = {"color": (0, 0, 0), "fill": None, "width": 1}
     for bbox in bboxes:  # add the border lines for all enveloping bboxes
         line_dict = make_line(path, bbox.tl, bbox.tr, clip)
         if line_dict:
-            EDGES.append(line_to_edge(line_dict))
+            edges.append(line_to_edge(line_dict))
 
         line_dict = make_line(path, bbox.bl, bbox.br, clip)
         if line_dict:
-            EDGES.append(line_to_edge(line_dict))
+            edges.append(line_to_edge(line_dict))
 
         line_dict = make_line(path, bbox.tl, bbox.bl, clip)
         if line_dict:
-            EDGES.append(line_to_edge(line_dict))
+            edges.append(line_to_edge(line_dict))
 
         line_dict = make_line(path, bbox.tr, bbox.br, clip)
         if line_dict:
-            EDGES.append(line_to_edge(line_dict))
+            edges.append(line_to_edge(line_dict))
 
     if add_lines is not None:  # add user-specified lines
         assert isinstance(add_lines, (tuple, list))
@@ -2555,7 +2557,7 @@ def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes
         p2 = pymupdf.Point(p2)
         line_dict = make_line(path, p1, p2, clip)
         if line_dict:
-            EDGES.append(line_to_edge(line_dict))
+            edges.append(line_to_edge(line_dict))
 
     if add_boxes is not None:  # add user-specified rectangles
         assert isinstance(add_boxes, (tuple, list))
@@ -2565,16 +2567,16 @@ def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes
         r = pymupdf.Rect(box)
         line_dict = make_line(path, r.tl, r.bl, clip)
         if line_dict:
-            EDGES.append(line_to_edge(line_dict))
+            edges.append(line_to_edge(line_dict))
         line_dict = make_line(path, r.bl, r.br, clip)
         if line_dict:
-            EDGES.append(line_to_edge(line_dict))
+            edges.append(line_to_edge(line_dict))
         line_dict = make_line(path, r.br, r.tr, clip)
         if line_dict:
-            EDGES.append(line_to_edge(line_dict))
+            edges.append(line_to_edge(line_dict))
         line_dict = make_line(path, r.tr, r.tl, clip)
         if line_dict:
-            EDGES.append(line_to_edge(line_dict))
+            edges.append(line_to_edge(line_dict))
 
 
 def page_rotation_set0(page):
@@ -2662,12 +2664,16 @@ def find_tables(
     paths=None,  # accept vector graphics as parameter
     use_layout: bool = True,  # gate line-based tables by layout table boxes
 ):
+    """Detect and extract tables on a page.
+
+    use_layout: if True (default), use page.get_layout() to find layout-
+    identified table regions first, and use them to restrict/complete the
+    line-based table detection; if layout ran and found no tables, return
+    an empty result immediately. Set False to always run full detection.
+    """
     pymupdf._warn_layout_once()
     _CHARS_VAR.set([])
     _EDGES_VAR.set([])
-    CHARS.clear()
-    EDGES.clear()
-    TEXTPAGE = None
     old_small = bool(pymupdf.TOOLS.set_small_glyph_heights())  # save old value
     pymupdf.TOOLS.set_small_glyph_heights(True)  # we need minimum bboxes
     if page.rotation != 0:
@@ -2770,6 +2776,10 @@ def find_tables(
         if old_xref is not None:
             page = page_rotation_reset(page, old_xref, old_rot, old_mediabox)
         pymupdf.TOOLS.unset_quad_corrections(old_quad_corrections)
+
+    # Snapshot the page's characters and attach them to each table so a later
+    # find_tables() call's CHARS reset cannot leak into this table's extract()
+    # (fixes a stale-text bug). Shared per call: one shallow copy, no re-scan.
     chars = list(CHARS)
     for table in tbf.tables:
         table.textpage = TEXTPAGE
