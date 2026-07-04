@@ -599,3 +599,243 @@ def test_find_tables_use_layout_true_without_layout_is_line_based():
     finally:
         pymupdf._get_layout = original_get_layout_fn
         doc.close()
+
+
+def _make_overmerged_page():
+    """A page whose line grid detects one tall body row that actually holds
+    three record lines -- an under-segmented (over-merged) grid the refinement
+    is meant to repair. Needs no layout, so it exercises the standalone benefit.
+    """
+    doc = pymupdf.open()
+    page = doc.new_page(width=400, height=300)
+    # 2-column grid: header row 100-120, a single tall body row 120-200.
+    for y in (100, 120, 200):
+        page.draw_line((100, y), (300, y))
+    for x in (100, 200, 300):
+        page.draw_line((x, 100), (x, 200))
+    page.insert_text((130, 114), "A")
+    page.insert_text((230, 114), "B")
+    # Three record lines crammed into the one body row.
+    for i, y in enumerate((140, 160, 180), start=1):
+        page.insert_text((130, y), str(i))
+        page.insert_text((230, y), str(i * 10))
+    return doc, page
+
+
+def test_refine_grid_splits_overmerged_body():
+    """refine_grid() splits an over-merged body row into one row per record.
+
+    *** PyMuPDF extension (opt-in grid refinement). ***
+    """
+    doc, page = _make_overmerged_page()
+    try:
+        grid = [
+            [[100, 100, 200, 120], [200, 100, 300, 120]],  # header row
+            [[100, 120, 200, 200], [200, 120, 300, 200]],  # one over-merged body row
+        ]
+        refined = pymupdf.table.refine_grid(page, grid, header_row_count=1)
+        # header kept, body row split into the three record rows
+        assert len(grid) == 2  # input untouched
+        assert len(refined) == 4
+        assert refined[0] == grid[0]  # header preserved verbatim
+        assert all(len(r) == 2 for r in refined)
+    finally:
+        doc.close()
+
+
+def test_find_tables_refine_splits_rows_default_unchanged():
+    """find_tables(refine=True) repairs the over-merged grid; the default result
+    is unchanged -- refinement is strictly opt-in.
+
+    *** PyMuPDF extension. ***
+    """
+    doc, page = _make_overmerged_page()
+    try:
+        default = page.find_tables(use_layout=False)
+        refined = page.find_tables(use_layout=False, refine=True)
+        assert len(default.tables) == 1
+        assert len(refined.tables) == 1
+
+        # Default detects the merged 2-row grid (unchanged behaviour).
+        assert default.tables[0].row_count == 2
+        assert default.tables[0].col_count == 2
+
+        # refine=True splits the body into three record rows.
+        t = refined.tables[0]
+        assert t.row_count == 4
+        assert t.col_count == 2
+        assert t.extract() == [
+            ["A", "B"],
+            ["1", "10"],
+            ["2", "20"],
+            ["3", "30"],
+        ]
+    finally:
+        doc.close()
+
+
+def _make_merged_header_page():
+    """A page whose line grid detects a header cell that spans both body columns.
+
+    The middle vertical divider is drawn only in the body (below the header
+    separator), so the top row is one wide cell over two columns while each body
+    row has two cells -- a merged header cell find_tables detects on its own.
+    Needs no layout, so it exercises the standalone benefit.
+    """
+    doc = pymupdf.open()
+    page = doc.new_page(width=400, height=300)
+    for y in (100, 120, 140, 160):
+        page.draw_line((100, y), (300, y))
+    page.draw_line((100, 100), (100, 160))  # left border
+    page.draw_line((300, 100), (300, 160))  # right border
+    page.draw_line((200, 120), (200, 160))  # middle divider: body only
+    page.insert_text((150, 114), "Merged Header")
+    page.insert_text((120, 134), "a")
+    page.insert_text((220, 134), "b")
+    page.insert_text((120, 154), "c")
+    page.insert_text((220, 154), "d")
+    return doc, page
+
+
+def test_resolve_spans_merged_header():
+    """resolve_spans() surfaces a merged header cell as a colspan-2 SpanCell.
+
+    *** PyMuPDF extension (opt-in span resolution). ***
+    """
+    doc, page = _make_merged_header_page()
+    try:
+        grid = [
+            [[100, 100, 300, 120]],  # header spanning both columns
+            [[100, 120, 200, 140], [200, 120, 300, 140]],
+            [[100, 140, 200, 160], [200, 140, 300, 160]],
+        ]
+        placements = pymupdf.table.resolve_spans(page, grid)
+        assert len(placements) == 3
+        # header is one placement spanning both columns
+        assert len(placements[0]) == 1
+        head = placements[0][0]
+        assert (head.colspan, head.rowspan) == (2, 1)
+        assert head.bbox == (100.0, 100.0, 300.0, 120.0)
+        assert "Merged Header" in head.text
+        # body cells stay 1x1
+        assert [(c.colspan, c.rowspan) for c in placements[1]] == [(1, 1), (1, 1)]
+        assert [c.text for c in placements[2]] == ["c", "d"]
+    finally:
+        doc.close()
+
+
+def test_find_tables_refine_exposes_placements_default_none():
+    """find_tables(refine=True) attaches Table.placements with the colspan/rowspan
+    structure; the default result exposes no placements and is otherwise unchanged.
+
+    *** PyMuPDF extension. ***
+    """
+    doc, page = _make_merged_header_page()
+    try:
+        default = page.find_tables(use_layout=False)
+        refined = page.find_tables(use_layout=False, refine=True)
+        assert len(default.tables) == 1
+        assert len(refined.tables) == 1
+
+        # Default detects the merged-header grid but resolves no spans.
+        dt = default.tables[0]
+        assert (dt.row_count, dt.col_count) == (3, 2)
+        assert dt.placements is None
+
+        # refine=True exposes the header cell's colspan via .placements.
+        t = refined.tables[0]
+        assert t.placements is not None
+        assert t.placements[0][0].colspan == 2
+        assert t.placements[0][0].rowspan == 1
+        assert [c.colspan for c in t.placements[1]] == [1, 1]
+    finally:
+        doc.close()
+
+
+def _make_bordered_table(page, x0, y0, texts):
+    """Draw a bordered 2x2 table (cells 100 wide, 20 tall) at (x0, y0), with the
+    2x2 ``texts`` grid inserted into its cells; returns nothing (mutates page)."""
+    x1, x2 = x0 + 100, x0 + 200
+    y1, y2 = y0 + 20, y0 + 40
+    for y in (y0, y1, y2):
+        page.draw_line((x0, y), (x2, y))
+    for x in (x0, x1, x2):
+        page.draw_line((x, y0), (x, y2))
+    for r, ry in enumerate((y0, y1)):
+        for c, cx in enumerate((x0, x1)):
+            page.insert_text((cx + 5, ry + 14), texts[r][c])
+
+
+def test_find_tables_union_fuses_layout_grid_with_line_candidate():
+    """find_tables(union=True) fuses the layout analyzer's GNN table grids with
+    the line-based finder's candidates: a layout table with no matching line
+    candidate is kept from its GNN grid, and a disjoint line-detected table is
+    appended -- layout order first, then appended candidates.
+
+    *** PyMuPDF extension (opt-in layout/candidate union). ***
+    """
+    import types
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=500, height=500)
+    # Table B: a real bordered 2x2 table the line finder detects (disjoint from A).
+    _make_bordered_table(page, 80, 300, [["b00", "b01"], ["b10", "b11"]])
+    try:
+        # Table A: only a layout (GNN) grid, no drawn lines. Inject the raw layout
+        # form union reads (return_raw=True shape): a "table" group whose
+        # table_grid carries interior h_lines/v_lines offsets.
+        grid_pred = types.SimpleNamespace(h_lines=[20.0], v_lines=[100.0])
+        page.layout_information = [
+            {
+                "class_name": "table",
+                "group_bbox": [80.0, 80.0, 280.0, 120.0],
+                "table_grid": grid_pred,
+            }
+        ]
+        tf = page.find_tables(use_layout=True, union=True)
+        tables = tf.tables
+        assert len(tables) == 2
+
+        # A first (layout order): a 2x2 grid built from group_bbox + interior lines.
+        a = tables[0]
+        assert (a.row_count, a.col_count) == (2, 2)
+        assert tuple(a.bbox) == (80.0, 80.0, 280.0, 120.0)
+        a_cells = [[cell for cell in row.cells] for row in a.rows]
+        assert a_cells[0][0] == (80.0, 80.0, 180.0, 100.0)
+        assert a_cells[1][1] == (180.0, 100.0, 280.0, 120.0)
+
+        # B appended after the layout table: the line-detected grid, extractable.
+        b = tables[1]
+        assert (b.row_count, b.col_count) == (2, 2)
+        assert b.extract()[0][0] == "b00"
+    finally:
+        doc.close()
+
+
+def test_find_tables_union_no_layout_degrades_to_line_candidates():
+    """union=True degrades to the pure line-based candidates when the layout
+    analyzer is unavailable: get_layout() is a no-op, layout_information stays
+    None, there are no primary grids, so every line-detected table is appended --
+    matching the plain line-based find_tables result.
+
+    *** PyMuPDF extension. ***
+    """
+    doc = pymupdf.open()
+    page = doc.new_page(width=400, height=400)
+    _make_bordered_table(page, 80, 80, [["a", "b"], ["c", "d"]])
+    original_get_layout_fn = pymupdf._get_layout
+    pymupdf._get_layout = None  # simulate: pymupdf.layout wheel not installed
+    try:
+        union = page.find_tables(use_layout=True, union=True)
+        assert page.layout_information is None
+
+        line = page.find_tables(strategy="lines_strict", use_layout=False)
+        assert len(union.tables) == 1
+        # Same table as the pure line-based path, just routed through the union.
+        assert [t.extract() for t in union.tables] == [t.extract() for t in line.tables]
+        t = union.tables[0]
+        assert (t.row_count, t.col_count) == (2, 2)
+        assert t.extract()[0][0] == "a"
+    finally:
+        pymupdf._get_layout = original_get_layout_fn
+        doc.close()
