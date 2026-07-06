@@ -1,4 +1,28 @@
 """
+Copyright (C) 2023 Artifex Software, Inc.
+
+This file is part of PyMuPDF.
+
+PyMuPDF is free software: you can redistribute it and/or modify it under the
+terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option)
+any later version.
+
+PyMuPDF is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
+details.
+
+You should have received a copy of the GNU Affero General Public License
+along with MuPDF. If not, see <https://www.gnu.org/licenses/agpl-3.0.en.html>
+
+Alternative licensing terms are available from the licensor.
+For commercial licensing, see <https://www.artifex.com/> or contact
+Artifex Software, Inc., 39 Mesa Street, Suite 108A, San Francisco,
+CA 94129, USA, for further information.
+
+---------------------------------------------------------------------
+
 PyMuPDF table cell-span resolution (opt-in extension).
 
 Split out of pymupdf/table.py. Provides SpanCell and resolve_spans (plus the
@@ -35,17 +59,18 @@ from pymupdf.table_refine import (
 # membership + rotated/vertical span substitution), which reproduces the engine's
 # page_words_cached byte-for-byte, so a claimed-word index set stays consistent.
 # Cell text is re-synthesized into lines here (_span_words_to_line_text), kept
-# separate from the CHARS/extract_words path used elsewhere in this file (which
-# clusters rawdict chars by tolerance -- different inputs, different results).
+# separate from the CHARS/extract_words path in pymupdf.table (which clusters
+# rawdict chars by tolerance -- different inputs, different results).
 # ---------------------------------------------------------------------------
 
 
 class SpanCell:
     """One reconstructed table cell after span resolution (PyMuPDF extension).
 
-    ``bbox`` is the placement's ``(x0, y0, x1, y1)`` union rect (``None`` only for
-    a synthetic pad cell), ``text`` the page text it claims (lines joined by
-    ``\\n``), and ``colspan``/``rowspan`` how many grid columns/rows it covers.
+    ``bbox`` is the placement's ``(x0, y0, x1, y1)`` union rect, ``text`` the
+    page text it claims (lines joined by ``\\n``), and ``colspan``/``rowspan``
+    how many grid columns/rows it covers. resolve_spans always sets a real bbox;
+    a caller padding its own grid may construct SpanCells with ``bbox=None``.
     HTML tagging (``td``/``th``) is deliberately not represented -- it is the
     caller's concern."""
 

@@ -1,4 +1,28 @@
 """
+Copyright (C) 2023 Artifex Software, Inc.
+
+This file is part of PyMuPDF.
+
+PyMuPDF is free software: you can redistribute it and/or modify it under the
+terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option)
+any later version.
+
+PyMuPDF is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
+details.
+
+You should have received a copy of the GNU Affero General Public License
+along with MuPDF. If not, see <https://www.gnu.org/licenses/agpl-3.0.en.html>
+
+Alternative licensing terms are available from the licensor.
+For commercial licensing, see <https://www.artifex.com/> or contact
+Artifex Software, Inc., 39 Mesa Street, Suite 108A, San Francisco,
+CA 94129, USA, for further information.
+
+---------------------------------------------------------------------
+
 PyMuPDF table union stage (opt-in extension).
 
 Split out of pymupdf/table.py. Provides _find_tables_union and the _union_* /
@@ -10,7 +34,7 @@ TableFinder and _iou come from pymupdf.table; find_tables is imported lazily
 
 import pymupdf
 
-from pymupdf.table import Table, TableFinder, _iou
+from pymupdf.table import CHARS, EDGES, Table, TableFinder, _iou
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +63,6 @@ from pymupdf.table import Table, TableFinder, _iou
 # in place pending a separate cleanup; the union path does not depend on it.
 # ---------------------------------------------------------------------------
 _UNION_STRATEGY = "lines_strict"          # candidate detection strategy
-_UNION_EDGE_THRESHOLD = 0.55              # forwarded to get_layout when layout absent
 _UNION_GRID_REF_IOU = 0.9                 # min IoU for a 1:1 grid-ref replacement
 _UNION_GRID_REF_SPAN_MULT_GATE = True     # reject under-segmented candidate grids
 _UNION_GRID_REF_SPAN_MULT_THRESHOLD = 3.0  # max horizontally-separated span groups per cell
@@ -328,18 +351,20 @@ def _union_replace_append(existing, candidates, *, page, grid_ref, grid_ref_iou,
     return entries
 
 
-def _find_tables_union(page, *, edge_threshold):
+def _find_tables_union(page):
     """Detect a page's tables by fusing layout grids with line-based candidates.
 
     (a) ensures the raw layout is present (computing it only when
-    page.layout_information is None -- unlocked, matching the official use_layout
-    path; the pymupdf4llm engine pre-populates it under its own lock), (b) reads
-    the primary grids, (c) detects line candidates, (d) applies grid-ref / split /
+    page.layout_information is None -- unlocked and with the analyzer's own
+    default edge_threshold, matching the official use_layout path; the pymupdf4llm
+    engine pre-populates it under its own lock, and a caller wanting a custom
+    threshold can likewise pre-populate via page.get_layout), (b) reads the
+    primary grids, (c) detects line candidates, (d) applies grid-ref / split /
     append, then returns a TableFinder whose .tables carry the fused grids in the
     contractual order. Each table's reported bbox is set explicitly (so a grid-ref
     table keeps its layout box); the grid is recoverable from Table.rows."""
     if page.layout_information is None:
-        page.get_layout(return_raw=True, edge_threshold=edge_threshold)
+        page.get_layout(return_raw=True)
     primaries = _layout_table_grids(page)
     candidates, finder = _union_line_candidates(page)
     entries = _union_replace_append(
@@ -351,7 +376,13 @@ def _find_tables_union(page, *, edge_threshold):
         span_mult_gate=_UNION_GRID_REF_SPAN_MULT_GATE,
         span_mult_threshold=_UNION_GRID_REF_SPAN_MULT_THRESHOLD,
     )
-    if finder is None:  # candidate detection failed; still return a valid shell
+    if finder is None:
+        # Candidate detection failed mid-way; the nested find_tables may have
+        # left partially-filled EDGES/CHARS state behind, and TableFinder's
+        # constructor runs a full detection from that state -- clear it first
+        # so the fallback really is an empty shell.
+        EDGES.clear()
+        CHARS.clear()
         finder = TableFinder(page)
     tables = []
     for bbox, grid in entries:

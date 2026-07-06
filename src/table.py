@@ -2782,8 +2782,8 @@ def find_tables(
             # TEXTPAGE comes from the nested finder for the extract() snapshot.
             # Imported here, not at module top, to avoid an import cycle:
             # table_union imports find_tables back from this module.
-            from pymupdf.table_union import _find_tables_union, _UNION_EDGE_THRESHOLD
-            tbf = _find_tables_union(page, edge_threshold=_UNION_EDGE_THRESHOLD)
+            from pymupdf.table_union import _find_tables_union
+            tbf = _find_tables_union(page)
             TEXTPAGE = tbf.textpage
         else:
             boxes = []
@@ -2847,7 +2847,9 @@ def find_tables(
                 grid = _refine_cells_to_grid(tab.cells)
                 grid = refine_grid(page, grid)
                 flat = _refine_grid_to_cells(grid)
-                new_tab = Table(page, flat) if flat else tab
+                # Preserve an explicit reported-bbox override (union grid-ref
+                # tables): the refined grid must not change the reported region.
+                new_tab = Table(page, flat, bbox=tab._bbox) if flat else tab
                 new_tab.placements = resolve_spans(page, _refine_cells_to_grid(new_tab.cells))
                 refined_tables.append(new_tab)
             tbf.tables = refined_tables

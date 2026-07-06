@@ -1,4 +1,28 @@
 """
+Copyright (C) 2023 Artifex Software, Inc.
+
+This file is part of PyMuPDF.
+
+PyMuPDF is free software: you can redistribute it and/or modify it under the
+terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option)
+any later version.
+
+PyMuPDF is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
+details.
+
+You should have received a copy of the GNU Affero General Public License
+along with MuPDF. If not, see <https://www.gnu.org/licenses/agpl-3.0.en.html>
+
+Alternative licensing terms are available from the licensor.
+For commercial licensing, see <https://www.artifex.com/> or contact
+Artifex Software, Inc., 39 Mesa Street, Suite 108A, San Francisco,
+CA 94129, USA, for further information.
+
+---------------------------------------------------------------------
+
 PyMuPDF table grid refinement (opt-in extension).
 
 Split out of pymupdf/table.py. Provides the public refine_grid /
@@ -35,8 +59,8 @@ import pymupdf
 # the word-selection semantics below -- center-point cell membership and
 # rotated/vertical span substitution -- reproduce the engine's page_words_cached
 # exactly and are deliberately kept separate from the CHARS/extract_words
-# machinery used elsewhere in this file (which clusters rawdict chars by
-# tolerance -- different inputs, different results).
+# machinery in pymupdf.table (which clusters rawdict chars by tolerance --
+# different inputs, different results).
 # ---------------------------------------------------------------------------
 
 _REFINE_LINE_GAP = 3.0  # center-y gap (points) that groups body words into lines
