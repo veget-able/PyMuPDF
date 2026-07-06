@@ -573,15 +573,15 @@ TRM-perfect 0.2252 → 0.4497.
 | − grid-ref only | 0.6827 | −3.8 |
 | − splitters | 0.6520 | −6.9 |
 | − spans | 0.6715 | −5.0 |
-| − header retag (pymupdf4llm-side) | 0.6559 | −6.5 |
+| − header tagging | 0.6559 | −6.5 |
 | TableHunter as union source (finder replaced) | 0.5206 | −20.1 |
 | No-layout engine (finder-only, no GNN) | 0.4034 | below baseline |
 | No-layout, splitters+spans off | 0.3065 | −9.7 vs no-layout engine |
 
-Reading: the core-migrated stages are union (+7.6), splitters (+6.9), spans
-(+5.0); header retag (+6.5) stays in pymupdf4llm (it keys on TRM). Without the GNN
-layout, recall collapses (0.4034 < 0.5673 baseline) — but there the refinement
-stages matter *more*, not less (splitters+spans worth +9.7).
+Reading: all four stages now live in core (see the note at the top) — union
+(+7.6), splitters (+6.9), spans (+5.0), and header tagging (+6.5, which keys on
+TRM). Without the GNN layout, recall collapses (0.4034 < 0.5673 baseline) — but
+there the refinement stages matter *more*, not less (splitters+spans worth +9.7).
 
 ### 6.3 Neutrality
 
