@@ -110,7 +110,6 @@ from pymupdf._table_spans import (
 # below resolves the header region and Table.to_html() serializes with it.
 from pymupdf._table_headers import (
     find_header_region,
-    _HEADER_FINDER,
     collapse_cell_ws,
     render_table_html,
 )
@@ -1616,11 +1615,9 @@ class Table:
         # PyMuPDF extension: filled by find_tables(refine=True). `placements` is a
         # row-major grid of tagged SpanCell colspan/rowspan placements (None on
         # the default path); the header meta describes it -- `header_rows` leading
-        # header rows, `stub_cols` left row-header columns, `section_rows` the
-        # collapsing section-label row indices.
+        # header rows, `section_rows` the collapsing section-label row indices.
         self.placements = None
         self.header_rows = 0
-        self.stub_cols = 0
         self.section_rows = ()
 
     @property
@@ -2797,17 +2794,12 @@ def _refine_placements_text_grid(grid):
     return [[collapse_cell_ws(cell.text) for cell in row] for row in grid]
 
 
-def _refine_tag_grid(grid, top_header_rows, left_stub_cols):
-    """Set each placement's HTML tag in place: cells in the top header rows, and
-    text-bearing cells in the left-stub columns, become ``th`` (else ``td``)."""
+def _refine_tag_grid(grid, top_header_rows):
+    """Set each placement's HTML tag in place: cells in the top header rows
+    become ``th``; every other cell becomes ``td``."""
     for row_idx, row in enumerate(grid):
-        for col_idx, cell in enumerate(row):
-            if row_idx < top_header_rows:
-                cell.tag = "th"
-            elif col_idx < left_stub_cols and collapse_cell_ws(cell.text):
-                cell.tag = "th"
-            else:
-                cell.tag = "td"
+        for cell in row:
+            cell.tag = "th" if row_idx < top_header_rows else "td"
     return grid
 
 
@@ -2816,11 +2808,7 @@ def _refine_body_start_row(page, cells):
     ask the header finder how many leading rows are header, clamped to [1, rows]."""
     try:
         model_grid = _refine_placement_or_flat_grid(page, cells)
-        region = find_header_region(
-            _refine_placements_text_grid(model_grid),
-            include_left_stub=False,
-            header_finder_options=_HEADER_FINDER,
-        )
+        region = find_header_region(_refine_placements_text_grid(model_grid))
     except Exception:
         return 1
     raw = region.top_header_rows
@@ -2833,12 +2821,8 @@ def _refine_build_placements(page, working, body_start):
     grid = _refine_placement_or_flat_grid(
         page, working, strict_colspan=True, header_row_count=body_start
     )
-    region = find_header_region(
-        _refine_placements_text_grid(grid),
-        include_left_stub=False,
-        header_finder_options=_HEADER_FINDER,
-    )
-    tagged = _refine_tag_grid(grid, region.top_header_rows, region.left_stub_cols)
+    region = find_header_region(_refine_placements_text_grid(grid))
+    tagged = _refine_tag_grid(grid, region.top_header_rows)
     return tagged, region
 
 
@@ -2902,7 +2886,7 @@ def find_tables(
     tagged td/th from the resolved header region. The tagged grid is attached as
     Table.placements (a row-major grid of SpanCell colspan/rowspan placements,
     each carrying its td/th tag; None on the default path), the header meta as
-    Table.header_rows/stub_cols/section_rows, and Table.to_html() serializes it.
+    Table.header_rows/section_rows, and Table.to_html() serializes it.
     Off by default, so the standard detection result (and extract()/to_markdown)
     is unchanged; opt in for grids that under-segment or carry merged cells. A
     grid whose column count the span resolution cannot preserve falls back to a
@@ -3027,8 +3011,8 @@ def find_tables(
             # then split over-merged body rows below it, then resolve the final
             # merged-cell placement grid (strict colspan), run the header rules on
             # its own text grid, and tag each placement td/th. The tagged grid is
-            # attached as .placements and the header meta as .header_rows/
-            # .stub_cols/.section_rows, so Table.to_html() serializes it directly.
+            # attached as .placements and the header meta as
+            # .header_rows/.section_rows, so Table.to_html() serializes it directly.
             refined_tables = []
             for tab in tbf.tables:
                 grid = _refine_cells_to_grid(tab.cells)
@@ -3048,7 +3032,6 @@ def find_tables(
                 placements, region = _refine_build_placements(page, working, body_start)
                 new_tab.placements = placements
                 new_tab.header_rows = region.top_header_rows
-                new_tab.stub_cols = region.left_stub_cols
                 new_tab.section_rows = region.section_header_rows
                 refined_tables.append(new_tab)
             tbf.tables = refined_tables

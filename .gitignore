@@ -6,7 +6,3 @@ build/
 demo/README.rst
 docs/build
 docs/_build
-
-# mupdf build dependency (downloaded/extracted to build PyMuPDF — not source)
-mupdf-*-source/
-mupdf-*-source.tar.gz

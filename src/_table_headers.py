@@ -37,27 +37,15 @@ delegates header tagging and serialization here:
 * the header rules below are the engine's ``header.py`` (find_header_region +
   HeaderRegion + the conservative rule predicates, incl. the under-tag
   extension), unchanged so a text grid resolves to the same header region;
-* ``_HEADER_FINDER`` is the engine reconstruct stage's enabled configuration;
 * ``collapse_cell_ws`` / ``escape_html_text`` / ``render_table_html`` are the
   engine's ``renderer.py`` single-pass serializer plus the two string helpers
   from its ``core.py`` -- byte-for-byte the HTML the engine has always emitted.
 """
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from statistics import mean
 from typing import Any
 import re
-@dataclass(frozen=True)
-class HeaderFinderLogicOption:
-    enabled: bool = True
-    version: str = "v1"
-
-
-@dataclass(frozen=True)
-class HeaderFinderOptions:
-    undertag_extension: HeaderFinderLogicOption = field(
-        default_factory=lambda: HeaderFinderLogicOption(enabled=False, version="v3_diag_gate")
-    )
 
 
 """Rule-based table header detection.
@@ -948,96 +936,23 @@ def find_top_header_rows_by_body_change(
     return 1
 
 
-def find_left_stub_columns(rows: list[list[str]], top_header_rows: int) -> int:
-    """Return leading body columns to mark as row headers."""
-    body = rows[top_header_rows:]
-    if len(body) < 2:
-        return 0
-    max_cols = max((len(row) for row in rows), default=0)
-    if max_cols < 3:
-        return 0
-
-    first_values = [column_text(row, 0) for row in body if column_text(row, 0).strip()]
-    if not first_values:
-        return 0
-
-    first_alpha = sum(1 for text in first_values if count_alpha(text) > 0) / len(first_values)
-    first_numeric = sum(1 for text in first_values if numeric_like(text)) / len(first_values)
-    other_values = [
-        column_text(row, col)
-        for row in body
-        for col in range(1, min(max_cols, len(row)))
-        if column_text(row, col).strip()
-    ]
-    other_numeric = sum(1 for text in other_values if numeric_like(text)) / max(1, len(other_values))
-
-    if first_alpha >= 0.50 and first_numeric <= 0.35 and other_numeric >= 0.45:
-        second_values = [column_text(row, 1) for row in body if column_text(row, 1).strip()]
-        if second_values:
-            second_alpha = sum(1 for text in second_values if count_alpha(text) > 0) / len(second_values)
-            second_numeric = sum(1 for text in second_values if numeric_like(text)) / len(second_values)
-            rest_values = [
-                column_text(row, col)
-                for row in body
-                for col in range(2, min(max_cols, len(row)))
-                if column_text(row, col).strip()
-            ]
-            rest_numeric = sum(1 for text in rest_values if numeric_like(text)) / max(1, len(rest_values))
-            if second_alpha >= 0.50 and second_numeric <= 0.35 and rest_numeric >= 0.45:
-                return 2
-        return 1
-    return 0
-
-
-
-
-
-
-
-
-
-
 @dataclass(frozen=True)
 class HeaderRegion:
-    rows: int
-    cols: int
     top_header_rows: int
-    left_stub_cols: int
     section_header_rows: tuple[int, ...]
 
 
-def find_header_region(
-    rows: list[list[str]],
-    *,
-    include_left_stub: bool,
-    header_finder_options: HeaderFinderOptions | None = None,
-) -> HeaderRegion:
-    opts = header_finder_options or HeaderFinderOptions()
+def find_header_region(rows: list[list[str]]) -> HeaderRegion:
     top_header_rows = find_top_header_rows_by_body_change(rows)
-    if opts.undertag_extension.enabled:
-        top_header_rows = extend_header_undertag(rows, top_header_rows)
-    left_stub_cols = find_left_stub_columns(rows, top_header_rows) if include_left_stub else 0
+    # The under-tag extension always runs on the refine=True reconstruction
+    # path: it promotes under-tagged column-header rows immediately below the
+    # detected header/body boundary (the engine's reconstruct-stage behaviour).
+    top_header_rows = extend_header_undertag(rows, top_header_rows)
     section_rows = tuple(section_header_rows(rows, top_header_rows))
     return HeaderRegion(
-        rows=len(rows),
-        cols=max((len(row) for row in rows), default=0),
         top_header_rows=top_header_rows,
-        left_stub_cols=left_stub_cols,
         section_header_rows=section_rows,
     )
-
-
-# ---------------------------------------------------------------------------
-# Header-finder configuration used by find_tables(refine=True) reconstruction.
-#
-# The engine's reconstruct stage runs find_header_region with the under-tag
-# extension enabled (v3_diag_gate); the default HeaderFinderOptions leaves it
-# off. This is that exact enabled configuration, so core's refine pipeline and
-# the engine resolve the same header region from the same text grid.
-# ---------------------------------------------------------------------------
-_HEADER_FINDER = HeaderFinderOptions(
-    undertag_extension=HeaderFinderLogicOption(enabled=True, version="v3_diag_gate")
-)
 
 
 # ---------------------------------------------------------------------------

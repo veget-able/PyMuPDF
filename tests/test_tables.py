@@ -781,19 +781,18 @@ def test_find_tables_refine_to_html_merged_header():
 
 
 def test_find_tables_refine_header_meta():
-    """find_tables(refine=True) exposes the header meta (header_rows/stub_cols/
-    section_rows) on the Table; the default path leaves the conservative defaults.
+    """find_tables(refine=True) exposes the header meta (header_rows/section_rows)
+    on the Table; the default path leaves the conservative defaults.
 
     *** PyMuPDF extension. ***
     """
     doc, page = _make_merged_header_page()
     try:
         default = page.find_tables(use_layout=False).tables[0]
-        assert (default.header_rows, default.stub_cols, default.section_rows) == (0, 0, ())
+        assert (default.header_rows, default.section_rows) == (0, ())
 
         t = page.find_tables(use_layout=False, refine=True).tables[0]
         assert isinstance(t.header_rows, int) and t.header_rows == 1
-        assert isinstance(t.stub_cols, int) and t.stub_cols == 0
         assert isinstance(t.section_rows, tuple) and t.section_rows == ()
     finally:
         doc.close()
