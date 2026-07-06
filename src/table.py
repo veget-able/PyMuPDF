@@ -87,21 +87,21 @@ from pymupdf import mupdf
 # The opt-in table refinement, cell-span and layout-union stages were split out
 # of this module into sibling modules; they are re-imported here so the public
 # pymupdf.table.* surface is unchanged for the pymupdf4llm HTML-table engine and
-# the tests (which import via pymupdf.table). table_refine is a leaf module and
-# table_spans imports only table_refine, so both are safe to import at load time;
-# table_union imports find_tables back from this module and is therefore imported
+# the tests (which import via pymupdf.table). _table_refine is a leaf module and
+# _table_spans imports only _table_refine, so both are safe to import at load time;
+# _table_union imports find_tables back from this module and is therefore imported
 # lazily inside find_tables() below, to avoid an import cycle.
-from pymupdf.table_refine import (
+from pymupdf._table_refine import (
     refine_grid,
     _refine_cells_to_grid,
     _refine_grid_to_cells,
 )
-from pymupdf.table_spans import resolve_spans
+from pymupdf._table_spans import resolve_spans
 
 # Additionally re-exported for the public pymupdf.table.* surface (used by the
 # pymupdf4llm HTML-table engine and the tests, not referenced inside this file):
-from pymupdf.table_refine import refine_grid_structure, refine_grid_rows  # noqa: F401
-from pymupdf.table_spans import SpanCell  # noqa: F401
+from pymupdf._table_refine import refine_grid_structure, refine_grid_rows  # noqa: F401
+from pymupdf._table_spans import SpanCell  # noqa: F401
 
 # -------------------------------------------------------------------
 # Start of PyMuPDF interface code
@@ -2781,8 +2781,8 @@ def find_tables(
             # so the make_chars/make_edges/TableFinder setup below is skipped;
             # TEXTPAGE comes from the nested finder for the extract() snapshot.
             # Imported here, not at module top, to avoid an import cycle:
-            # table_union imports find_tables back from this module.
-            from pymupdf.table_union import _find_tables_union
+            # _table_union imports find_tables back from this module.
+            from pymupdf._table_union import _find_tables_union
             tbf = _find_tables_union(page)
             TEXTPAGE = tbf.textpage
         else:

@@ -28,12 +28,12 @@ PyMuPDF table cell-span resolution (opt-in extension).
 Split out of pymupdf/table.py. Provides SpanCell and resolve_spans (plus the
 _span_* helpers), which reconstruct a detected table's merged-cell (colspan /
 rowspan) structure. Re-exported by pymupdf.table; never runs on the default
-find_tables() path. Reuses the word-selection helpers of pymupdf.table_refine.
+find_tables() path. Reuses the word-selection helpers of pymupdf._table_refine.
 """
 
 import pymupdf
 
-from pymupdf.table_refine import (
+from pymupdf._table_refine import (
     _refine_is_vertical_or_rotated,
     _refine_page_words,
 )
