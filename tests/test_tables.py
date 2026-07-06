@@ -717,6 +717,9 @@ def test_resolve_spans_merged_header():
         assert (head.colspan, head.rowspan) == (2, 1)
         assert head.bbox == (100.0, 100.0, 300.0, 120.0)
         assert "Merged Header" in head.text
+        # resolve_spans leaves the HTML tag at its default; tagging td/th is the
+        # caller's job (find_tables(refine=True) / the engine model builder).
+        assert head.tag == "td"
         # body cells stay 1x1
         assert [(c.colspan, c.rowspan) for c in placements[1]] == [(1, 1), (1, 1)]
         assert [c.text for c in placements[2]] == ["c", "d"]
@@ -748,8 +751,104 @@ def test_find_tables_refine_exposes_placements_default_none():
         assert t.placements[0][0].colspan == 2
         assert t.placements[0][0].rowspan == 1
         assert [c.colspan for c in t.placements[1]] == [1, 1]
+        # placements are tagged: the top header row is th, body rows are td.
+        assert t.placements[0][0].tag == "th"
+        assert [c.tag for c in t.placements[1]] == ["td", "td"]
+        assert [c.tag for c in t.placements[2]] == ["td", "td"]
     finally:
         doc.close()
+
+
+def test_find_tables_refine_to_html_merged_header():
+    """find_tables(refine=True) + Table.to_html() serialize a merged header as a
+    <th colspan=2>, with body rows as <td>.
+
+    *** PyMuPDF extension (opt-in header tagging + HTML serialization). ***
+    """
+    doc, page = _make_merged_header_page()
+    try:
+        t = page.find_tables(use_layout=False, refine=True).tables[0]
+        html = t.to_html()
+        assert html == (
+            "<table>"
+            '<tr><th colspan="2">Merged Header</th></tr>'
+            "<tr><td>a</td><td>b</td></tr>"
+            "<tr><td>c</td><td>d</td></tr>"
+            "</table>"
+        )
+    finally:
+        doc.close()
+
+
+def test_find_tables_refine_header_meta():
+    """find_tables(refine=True) exposes the header meta (header_rows/stub_cols/
+    section_rows) on the Table; the default path leaves the conservative defaults.
+
+    *** PyMuPDF extension. ***
+    """
+    doc, page = _make_merged_header_page()
+    try:
+        default = page.find_tables(use_layout=False).tables[0]
+        assert (default.header_rows, default.stub_cols, default.section_rows) == (0, 0, ())
+
+        t = page.find_tables(use_layout=False, refine=True).tables[0]
+        assert isinstance(t.header_rows, int) and t.header_rows == 1
+        assert isinstance(t.stub_cols, int) and t.stub_cols == 0
+        assert isinstance(t.section_rows, tuple) and t.section_rows == ()
+    finally:
+        doc.close()
+
+
+def test_table_to_html_fallback_flat():
+    """Table.to_html() on a default (non-refined) table returns a well-formed,
+    td-only flat <table> built from extract() -- no placements needed.
+
+    *** PyMuPDF extension. ***
+    """
+    doc, page = _make_merged_header_page()
+    try:
+        t = page.find_tables(use_layout=False).tables[0]
+        assert t.placements is None
+        html = t.to_html()
+        assert html.startswith("<table>") and html.endswith("</table>")
+        assert "<th" not in html  # flat fallback is td-only
+        assert html.count("<tr>") == t.row_count
+        # every cell is a plain <td>; the merged header text lands in one cell
+        assert "<td>Merged Header</td>" in html
+        assert "<td>a</td>" in html and "<td>d</td>" in html
+    finally:
+        doc.close()
+
+
+def test_render_table_html_section_row_collapse():
+    """The core serializer collapses a section-label row (a lone centered label)
+    to a single <th colspan=N>, and honours per-cell td/th tags + colspan.
+
+    *** PyMuPDF extension (HTML serialization). ***
+    """
+    from pymupdf._table_headers import render_table_html
+    from pymupdf.table import SpanCell
+
+    def cell(text, colspan=1, rowspan=1, tag="td"):
+        return SpanCell(bbox=None, text=text, colspan=colspan, rowspan=rowspan, tag=tag)
+
+    rows = [
+        [cell("Group", colspan=3, tag="th")],
+        [cell(""), cell("Section", tag="th"), cell("")],  # centered section label
+        [cell("x"), cell("1"), cell("2")],
+    ]
+    html = render_table_html(rows, section_header_rows=(1,))
+    assert html == (
+        "<table>"
+        '<tr><th colspan="3">Group</th></tr>'
+        '<tr><th colspan="3">Section</th></tr>'
+        "<tr><td>x</td><td>1</td><td>2</td></tr>"
+        "</table>"
+    )
+    # escaping (& < >) and <br/> line joins, quotes left literal
+    assert render_table_html([[cell('a & b < c > "d"\nsecond')]]) == (
+        '<table><tr><td>a &amp; b &lt; c &gt; "d"<br/>second</td></tr></table>'
+    )
 
 
 def _make_bordered_table(page, x0, y0, texts):

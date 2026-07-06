@@ -71,14 +71,18 @@ class SpanCell:
     page text it claims (lines joined by ``\\n``), and ``colspan``/``rowspan``
     how many grid columns/rows it covers. resolve_spans always sets a real bbox;
     a caller padding its own grid may construct SpanCells with ``bbox=None``.
-    HTML tagging (``td``/``th``) is deliberately not represented -- it is the
-    caller's concern."""
 
-    def __init__(self, bbox, text, colspan, rowspan):
+    ``tag`` is the cell's HTML tag (``"td"``/``"th"``), defaulting to ``"td"``.
+    resolve_spans leaves it at the default; find_tables(refine=True) overwrites
+    it from the resolved header region so Table.to_html() can serialize the grid
+    directly, and a caller building its own grid may set it too."""
+
+    def __init__(self, bbox, text, colspan, rowspan, tag="td"):
         self.bbox = bbox
         self.text = text
         self.colspan = colspan
         self.rowspan = rowspan
+        self.tag = tag
 
 
 # --- slot geometry: cluster cell edges into column/row boundaries ------------

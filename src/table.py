@@ -92,16 +92,34 @@ from pymupdf import mupdf
 # _table_union imports find_tables back from this module and is therefore imported
 # lazily inside find_tables() below, to avoid an import cycle.
 from pymupdf._table_refine import (
-    refine_grid,
+    refine_grid_structure,
+    refine_grid_rows,
     _refine_cells_to_grid,
     _refine_grid_to_cells,
+    _refine_page_words,
 )
-from pymupdf._table_spans import resolve_spans
+from pymupdf._table_spans import (
+    resolve_spans,
+    SpanCell,
+    _span_select_words_in_rect,
+    _span_word_line_tuple,
+    _span_words_to_line_text,
+)
+# Header semantics + HTML serialization live in the pure _table_headers sibling
+# (verbatim-adapted from the pymupdf4llm engine); the refine=True reconstruction
+# below resolves the header region and Table.to_html() serializes with it.
+from pymupdf._table_headers import (
+    find_header_region,
+    _HEADER_FINDER,
+    collapse_cell_ws,
+    render_table_html,
+)
 
-# Additionally re-exported for the public pymupdf.table.* surface (used by the
-# pymupdf4llm HTML-table engine and the tests, not referenced inside this file):
-from pymupdf._table_refine import refine_grid_structure, refine_grid_rows  # noqa: F401
-from pymupdf._table_spans import SpanCell  # noqa: F401
+# refine_grid is the all-in-one wrapper: the refine=True pipeline calls the
+# two-phase refine_grid_structure/refine_grid_rows directly, so it is not used
+# inside this module -- kept as a re-export for the public pymupdf.table.*
+# surface and the tests.
+from pymupdf._table_refine import refine_grid  # noqa: F401
 
 # -------------------------------------------------------------------
 # Start of PyMuPDF interface code
@@ -1595,7 +1613,15 @@ class Table:
         # from its replacement cell grid.
         self._bbox = bbox
         self.header = self._get_header()  # PyMuPDF extension
-        self.placements = None  # PyMuPDF extension: filled by find_tables(refine=True)
+        # PyMuPDF extension: filled by find_tables(refine=True). `placements` is a
+        # row-major grid of tagged SpanCell colspan/rowspan placements (None on
+        # the default path); the header meta describes it -- `header_rows` leading
+        # header rows, `stub_cols` left row-header columns, `section_rows` the
+        # collapsing section-label row indices.
+        self.placements = None
+        self.header_rows = 0
+        self.stub_cols = 0
+        self.section_rows = ()
 
     @property
     def bbox(self):
@@ -1735,6 +1761,32 @@ class Table:
             line += "\n"
             output += line
         return output + "\n"
+
+    def to_html(self):
+        """Output table content as an HTML ``<table>`` string.
+
+        When span placements are present (this table came from
+        ``find_tables(refine=True)``), serialize them: each placement's
+        ``colspan``/``rowspan`` and its ``th``/``td`` tag are honoured, and a
+        section-label row collapses to a single ``<th colspan=N>`` spanning the
+        row. Otherwise (the default detection path) fall back to a flat, td-only
+        ``<table>`` built from :meth:`extract`, with this table's
+        ``row_count`` x ``col_count`` shape. Cell text is HTML-escaped (only
+        ``& < >``) and internal newlines become ``<br/>``. Like
+        :meth:`extract`, the fallback reads the stored character snapshot, so it
+        is stable across later ``find_tables()`` calls and page rotation.
+        """
+        if self.placements is not None:
+            return render_table_html(self.placements, self.section_rows)
+        # Default path: no resolved placements -- flat td-only grid from extract().
+        rows = [
+            [
+                SpanCell(bbox=None, text=(cell or ""), colspan=1, rowspan=1)
+                for cell in row
+            ]
+            for row in self.extract()
+        ]
+        return render_table_html(rows)
 
     def to_pandas(self, **kwargs):
         """Return a pandas DataFrame version of the table."""
@@ -2664,6 +2716,132 @@ def page_rotation_reset(page, xref, rot, mediabox):
     return page
 
 
+# ---------------------------------------------------------------------------
+# refine=True reconstruction glue (PyMuPDF extension)
+#
+# These mirror the pymupdf4llm HTML-table engine's reconstruct.py, so that
+# find_tables(refine=True) produces the same tagged placement grid the engine
+# builds (which it feeds to the same serializer, now pymupdf._table_headers).
+# They resolve a merged-cell placement grid (falling back to a flat 1x1 grid
+# when span resolution changes the column count), ask the header finder how the
+# grid splits into header/body, and tag each placement td/th accordingly. Pure
+# glue over resolve_spans (spans), find_header_region (headers) and the refine_*
+# stages; only reached when refine=True, so official behaviour is unchanged.
+# ---------------------------------------------------------------------------
+def _refine_placement_grid_width(placements):
+    """Column extent of a placement grid after resolving colspan/rowspan."""
+    occupied = set()
+    max_col = 0
+    for row_idx, row in enumerate(placements):
+        col_idx = 0
+        for placement in row:
+            while (row_idx, col_idx) in occupied:
+                col_idx += 1
+            for dr in range(placement.rowspan):
+                for dc in range(placement.colspan):
+                    occupied.add((row_idx + dr, col_idx + dc))
+            col_idx += placement.colspan
+            max_col = max(max_col, col_idx)
+    return max_col
+
+
+def _refine_flat_placement_grid(page, cells, col_count):
+    """Flat fallback grid: one 1x1 SpanCell per slot, padded to ``col_count``.
+
+    Center-point word selection + line synthesis per cell ("" for a grid gap),
+    the flat assignment used when span resolution changes the column count. Uses
+    the same word source/line builder as resolve_spans (``_refine_page_words`` +
+    ``_span_words_to_line_text``), so the flat cell text matches the engine's."""
+    page_words = _refine_page_words(page)
+    grid = []
+    for row in cells:
+        out = []
+        for cell in row:
+            if cell is None:
+                out.append(SpanCell(bbox=None, text="", colspan=1, rowspan=1))
+            else:
+                rect = pymupdf.Rect(cell)
+                line_words = [
+                    _span_word_line_tuple(word)
+                    for _, word in _span_select_words_in_rect(page_words, rect)
+                ]
+                out.append(
+                    SpanCell(
+                        bbox=tuple(rect),
+                        text=_span_words_to_line_text(line_words),
+                        colspan=1,
+                        rowspan=1,
+                    )
+                )
+        while len(out) < col_count:
+            out.append(SpanCell(bbox=None, text="", colspan=1, rowspan=1))
+        grid.append(out)
+    return grid
+
+
+def _refine_placement_or_flat_grid(page, cells, *, strict_colspan=False, header_row_count=None):
+    """The reconstructed cell grid: resolved SpanCell placements, or the flat 1x1
+    fallback when span resolution changes the column count (grid width != col
+    count). ``strict_colspan``/``header_row_count`` pass straight to resolve_spans."""
+    col_count = max((len(row) for row in cells), default=0)
+    placements = resolve_spans(
+        page, cells, header_row_count=header_row_count, strict_colspan=strict_colspan
+    )
+    if _refine_placement_grid_width(placements) == col_count:
+        return placements
+    return _refine_flat_placement_grid(page, cells, col_count)
+
+
+def _refine_placements_text_grid(grid):
+    """Row-major whitespace-collapsed cell text -- the ``[[text]]`` header rules read."""
+    return [[collapse_cell_ws(cell.text) for cell in row] for row in grid]
+
+
+def _refine_tag_grid(grid, top_header_rows, left_stub_cols):
+    """Set each placement's HTML tag in place: cells in the top header rows, and
+    text-bearing cells in the left-stub columns, become ``th`` (else ``td``)."""
+    for row_idx, row in enumerate(grid):
+        for col_idx, cell in enumerate(row):
+            if row_idx < top_header_rows:
+                cell.tag = "th"
+            elif col_idx < left_stub_cols and collapse_cell_ws(cell.text):
+                cell.tag = "th"
+            else:
+                cell.tag = "td"
+    return grid
+
+
+def _refine_body_start_row(page, cells):
+    """Header/body boundary: resolve the merge-preserved placement grid once and
+    ask the header finder how many leading rows are header, clamped to [1, rows]."""
+    try:
+        model_grid = _refine_placement_or_flat_grid(page, cells)
+        region = find_header_region(
+            _refine_placements_text_grid(model_grid),
+            include_left_stub=False,
+            header_finder_options=_HEADER_FINDER,
+        )
+    except Exception:
+        return 1
+    raw = region.top_header_rows
+    return max(1, min(int(raw), len(cells))) if cells else 0
+
+
+def _refine_build_placements(page, working, body_start):
+    """Resolve the final placement grid (strict colspan, header boundary known),
+    run header rules on its own text grid, tag cells -> (tagged grid, region)."""
+    grid = _refine_placement_or_flat_grid(
+        page, working, strict_colspan=True, header_row_count=body_start
+    )
+    region = find_header_region(
+        _refine_placements_text_grid(grid),
+        include_left_stub=False,
+        header_finder_options=_HEADER_FINDER,
+    )
+    tagged = _refine_tag_grid(grid, region.top_header_rows, region.left_stub_cols)
+    return tagged, region
+
+
 def find_tables(
     page,
     clip=None,
@@ -2714,15 +2892,21 @@ def find_tables(
     without re-running the analyzer. use_layout / refine combine with it (union
     supersedes the ordinary use_layout gating).
 
-    refine: if True, refine each detected table's cell grid with refine_grid()
-    before building the Table -- splitting rows/columns the line grid merged
-    (using page text and background shading) -- and additionally resolve each
-    table's merged-cell structure with resolve_spans(), attaching the result as
-    Table.placements (a row-major grid of SpanCell colspan/rowspan placements;
-    None on the default path). Off by default, so the standard detection result
-    (and extract()/to_markdown) is unchanged; opt in for grids that under-segment
-    or carry merged cells. The header/body split uses a conservative single
-    header row (header_row_count=1).
+    refine: if True, refine each detected table's cell grid before building the
+    Table -- splitting rows/columns the line grid merged (using page text and
+    background shading) -- then reconstruct its merged-cell structure and header
+    semantics. The structural split (shaded rows, under-segmented columns) runs
+    first; the header/body boundary is resolved on that intermediate grid; the
+    over-merged body rows below it are split; then the final merged-cell grid is
+    resolved (colspan constrained to the header/body split) and each placement is
+    tagged td/th from the resolved header region. The tagged grid is attached as
+    Table.placements (a row-major grid of SpanCell colspan/rowspan placements,
+    each carrying its td/th tag; None on the default path), the header meta as
+    Table.header_rows/stub_cols/section_rows, and Table.to_html() serializes it.
+    Off by default, so the standard detection result (and extract()/to_markdown)
+    is unchanged; opt in for grids that under-segment or carry merged cells. A
+    grid whose column count the span resolution cannot preserve falls back to a
+    flat one-cell-per-slot placement grid, so refinement never crashes a table.
     """
     pymupdf._warn_layout_once()
     _CHARS_VAR.set([])
@@ -2834,23 +3018,38 @@ def find_tables(
                 cells = make_table_from_bbox(tp2, word_rects, rect)  # pylint: disable=E0606
                 tbf.tables.append(Table(page, cells))
         if refine:
-            # Opt-in grid refinement (PyMuPDF extension). Runs while the page is
-            # still derotated (before the finally block resets rotation) so word
-            # and vector coordinates match the detected cells. Each table's flat
-            # cell list is converted to a row-major grid, refined, and rebuilt
-            # into a fresh Table so rows/cells/header are recomputed from it, then
-            # its merged-cell structure is resolved and attached as .placements
-            # (eager, and here while derotated, because resolve_spans reads the
-            # page words in the same coordinate frame as the refined cells).
+            # Opt-in grid refinement + reconstruction (PyMuPDF extension). Runs
+            # while the page is still derotated (before the finally block resets
+            # rotation) so word and vector coordinates match the detected cells.
+            # Reproduces the pymupdf4llm HTML-table engine's reconstruction order
+            # exactly: structural split (shaded rows + under-segmented columns),
+            # then resolve the header/body boundary on that intermediate grid,
+            # then split over-merged body rows below it, then resolve the final
+            # merged-cell placement grid (strict colspan), run the header rules on
+            # its own text grid, and tag each placement td/th. The tagged grid is
+            # attached as .placements and the header meta as .header_rows/
+            # .stub_cols/.section_rows, so Table.to_html() serializes it directly.
             refined_tables = []
             for tab in tbf.tables:
                 grid = _refine_cells_to_grid(tab.cells)
-                grid = refine_grid(page, grid)
-                flat = _refine_grid_to_cells(grid)
+                # The reported bbox (a union grid-ref table's layout box, else the
+                # cells' union) bounds the shaded-rectangle search, matching the
+                # engine which passes tuple(table.bbox).
+                working = refine_grid_structure(page, grid, table_bbox=tab.bbox)
+                body_start = _refine_body_start_row(page, working)
+                working = refine_grid_rows(page, working, header_row_count=body_start)
+                flat = _refine_grid_to_cells(working)
                 # Preserve an explicit reported-bbox override (union grid-ref
                 # tables): the refined grid must not change the reported region.
                 new_tab = Table(page, flat, bbox=tab._bbox) if flat else tab
-                new_tab.placements = resolve_spans(page, _refine_cells_to_grid(new_tab.cells))
+                # Build the tagged model on `working` directly (as the engine
+                # does) -- not on a re-gridded new_tab.cells -- so the placements
+                # match the engine's serialized grid byte-for-byte.
+                placements, region = _refine_build_placements(page, working, body_start)
+                new_tab.placements = placements
+                new_tab.header_rows = region.top_header_rows
+                new_tab.stub_cols = region.left_stub_cols
+                new_tab.section_rows = region.section_header_rows
                 refined_tables.append(new_tab)
             tbf.tables = refined_tables
     except Exception as e:
