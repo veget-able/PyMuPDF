@@ -32,6 +32,8 @@ TableFinder and _iou come from pymupdf.table; find_tables is imported lazily
 (see _union_line_candidates) to avoid an import cycle.
 """
 
+import os
+
 import pymupdf
 
 from pymupdf.table import CHARS, EDGES, Table, TableFinder, _iou
@@ -139,6 +141,149 @@ def _union_line_candidates(page):
         seen.add(key)
         candidates.append((bbox, grid))
     return candidates, finder
+
+
+# --------------------------------------------------------------------------- #
+# EXPERIMENTAL: MuPDF's TableHunter as the union candidate source.
+#
+# Selected with the environment variable PYMUPDF_TABLE_UNION_SOURCE=hunter
+# (default: unset -> the line-based finder path below, byte-identical to the
+# review branch). Exists so that upstream can drop a modified MuPDF/hunter
+# build into the exact same fusion pipeline and read the effect directly off
+# the ParseBench GTRM score. Measured on the unmodified 1.28.0 detector this
+# path scores 0.5205 vs 0.7211 for the line finder (503 pages; matches the
+# original engine-level investigation's 0.5206) -- the gap is grid
+# over-segmentation, not region recovery. See the standalone study at
+# https://github.com/veget-able/tablehunter-comparison for details.
+# --------------------------------------------------------------------------- #
+
+_HUNTER_PAD = 3.0  # points of slack around each layout table box
+
+
+def _hunter_parse_bbox(text):
+    if not text:
+        return None
+    try:
+        parts = tuple(float(value) for value in text.split())
+    except ValueError:
+        return None
+    return parts if len(parts) == 4 else None
+
+
+def _hunter_table_cells(table_el):
+    """Walk a std="Table" struct element into rows of TD bboxes.
+
+    TR/TD nesting is taken from direct children only (a nested table's cells
+    are not hoisted). Rows may be ragged where the detector emits a spanned
+    cell as one wide/tall TD; empty rows are dropped.
+    """
+    rows = []
+    for tr_el in table_el:
+        if tr_el.tag != "struct" or tr_el.get("std") != "TR":
+            continue
+        row = []
+        for td_el in tr_el:
+            if td_el.tag != "struct" or td_el.get("std") != "TD":
+                continue
+            bbox = _hunter_parse_bbox(td_el.get("bbox"))
+            if bbox is not None:
+                row.append(bbox)
+        if row:
+            rows.append(row)
+    return rows
+
+
+def _hunter_layout_table_boxes(page):
+    """All "table"-class layout boxes as non-empty Rects.
+
+    Handles both shapes page.layout_information can carry: the raw dict form
+    (get_layout(return_raw=True) -- group_bbox + class_name) and the
+    normalized tuple form (x0, y0, x1, y1, class_name)."""
+    boxes = []
+    for box in page.layout_information or []:
+        if isinstance(box, dict):
+            if box.get("class_name") != "table":
+                continue
+            group_bbox = box.get("group_bbox")
+            if not group_bbox:
+                continue
+            rect = pymupdf.Rect(group_bbox)
+        elif len(box) >= 5 and box[4] == "table":
+            rect = pymupdf.Rect(box[:4])
+        else:
+            continue
+        if not rect.is_empty:
+            boxes.append(rect)
+    return boxes
+
+
+def _union_hunter_candidates(page):
+    """Hunter-driven union candidates: fz_find_table_within_bounds per box.
+
+    Experimental counterpart of _union_line_candidates. It populates CHARS
+    exactly like the nested line finder would (the downstream refine/span/
+    header stages and Table.extract() read it) but performs no line-based
+    detection -- the grid candidates come from MuPDF's bounded table detector
+    instead. One detector textpage (TABLE_DETECTOR_FLAGS) is built per page
+    and reused across boxes: the C function rewrites the stext block list in
+    place and accumulates one Table struct per call, and the SWIG block
+    wrapper does not expose the struct union, so the serialized XML is the
+    supported walk. Returns (candidates, finder-shell) like its counterpart.
+    """
+    if not (hasattr(pymupdf, "mupdf") and hasattr(pymupdf.mupdf, "fz_find_table_within_bounds")):
+        raise RuntimeError(
+            "PYMUPDF_TABLE_UNION_SOURCE=hunter requires a PyMuPDF build that "
+            "exposes pymupdf.mupdf.fz_find_table_within_bounds"
+        )
+    import xml.etree.ElementTree as ET
+
+    from pymupdf.table import TABLE_DETECTOR_FLAGS, make_chars
+
+    EDGES.clear()
+    CHARS.clear()
+    textpage = make_chars(page)
+    shell = TableFinder(page)  # EDGES is empty: an empty shell, no line detection
+    shell.textpage = textpage
+
+    candidates = []
+    boxes = _hunter_layout_table_boxes(page)
+    if boxes:
+        page_rect = pymupdf.Rect(page.rect)
+        detector_tp = page.get_textpage(flags=TABLE_DETECTOR_FLAGS)
+        stext = detector_tp.this
+        for box in boxes:
+            bounds = pymupdf.Rect(
+                max(float(page_rect.x0), float(box.x0) - _HUNTER_PAD),
+                max(float(page_rect.y0), float(box.y0) - _HUNTER_PAD),
+                min(float(page_rect.x1), float(box.x1) + _HUNTER_PAD),
+                min(float(page_rect.y1), float(box.y1) + _HUNTER_PAD),
+            )
+            if bounds.is_empty:
+                continue
+            pymupdf.mupdf.fz_find_table_within_bounds(
+                stext,
+                pymupdf.mupdf.FzRect(bounds.x0, bounds.y0, bounds.x1, bounds.y1),
+            )
+        seen = set()
+        root = ET.fromstring(detector_tp.extractXML())
+        for table_el in root.iter("struct"):
+            if table_el.get("std") != "Table":
+                continue
+            bbox = _hunter_parse_bbox(table_el.get("bbox"))
+            if bbox is None:
+                continue
+            rect = pymupdf.Rect(bbox)
+            if rect.is_empty:
+                continue
+            grid = _hunter_table_cells(table_el)
+            if not grid:
+                continue
+            key = tuple(round(value) for value in rect)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append((rect, grid))
+    return candidates, shell
 
 
 def _union_rect_area(rect):
@@ -366,7 +511,13 @@ def _find_tables_union(page):
     if page.layout_information is None:
         page.get_layout(return_raw=True)
     primaries = _layout_table_grids(page)
-    candidates, finder = _union_line_candidates(page)
+    # Experimental evaluation knob (see the hunter block above): route the
+    # union's candidate source through MuPDF's TableHunter instead of the
+    # Python line finder. Unset -> unchanged default path.
+    if os.environ.get("PYMUPDF_TABLE_UNION_SOURCE", "").strip().lower() == "hunter":
+        candidates, finder = _union_hunter_candidates(page)
+    else:
+        candidates, finder = _union_line_candidates(page)
     entries = _union_replace_append(
         primaries,
         candidates,
