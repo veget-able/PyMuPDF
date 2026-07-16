@@ -496,6 +496,37 @@ Recommend squashing to a small, reviewable set before submission.
   the probe result process-wide so the subprocess cost is paid at most once
   instead of per call/page.
 
+### 4.4 `cells_to_tables()` text probe rebuilds a TextPage per candidate (module-global `TEXTPAGE` never assigned)
+
+- **Summary.** `cells_to_tables()`'s "remove tables without text" filter calls
+  `page.get_textbox(r, textpage=TEXTPAGE)` with the module-global `TEXTPAGE` —
+  but nothing ever assigns that global. Its comment ("textpage for cell text
+  extraction") and the `TEXTPAGE = make_chars(...)` binding in `find_tables()`
+  suggest the sharing was intended and a `global` statement was lost at some
+  point; as written, `make_chars()` and `find_tables()` only bind locals of the
+  same name, so the probe always receives `textpage=None`. `get_textbox()` then
+  builds a fresh full-page TextPage **and Python-walks every character of it**
+  (`JM_copy_rectangle`) — once per candidate table. Measured on ParseBench's
+  table corpus: ~24 ms per probe, ~30% of `find_tables()` wall time — the
+  largest single cost after character extraction, spent re-deriving information
+  that is already sitting in `CHARS` at that point.
+- **Affected versions.** Released 1.28.0 (`src/table.py`: module global
+  `TEXTPAGE = None`; the whitespace filter in `cells_to_tables()`). The same
+  never-assigned global is present on current upstream main.
+- **Fix (implemented and measured).** Probe the call's existing `CHARS` instead:
+  same strict-overlap rule as `JM_rects_overlap()`, same whitespace-only
+  rejection, built lazily only when a candidate survives the geometric checks —
+  and drop the dead global. One commit, `src/table.py` only (+27/−8):
+  https://github.com/veget-able/PyMuPDF/commit/35c633ce7c54f71796b20226c699c0cd6a88068f
+  Across all 503 benchmark pages the produced tables are hash-identical
+  (bbox + cells, 636 tables) and GTRM is unchanged at 72.11 to four decimals;
+  `find_tables()` mean wall time drops 106.1 → 75.9 ms/page (−28%).
+- **Why not just pass the TextPage through.** Threading `make_chars()`'s
+  TextPage into the probe restores the apparent original intent but recovers
+  almost nothing (−0.7% measured): `extractTextbox` itself Python-walks every
+  character of the page per call (~22 ms), so the cost is the walk, not the
+  build. The `CHARS` scan removes both.
+
 ---
 
 ## 5. TableFinder / TableHunter position
@@ -542,6 +573,26 @@ rowspan/colspan, so a real spanned cell cannot round-trip.
 Reproducible comparison package: `tablehunter-comparison/`
 (`compare_finder_hunter.py`, `repro_make_table_from_bbox_bug.py`, and the
 `examples/` grid-pair gallery).
+
+**Addendum (2026-07-16, after the raft question).** A fair challenge to this
+position is whether the finder earns its runtime when a cheaper region source —
+e.g. rafts, connected clusters of overlapping vector bboxes — could stand in
+for it. Two measurements say that trade is not available. First, the finder's
+contribution to the union is its *cells*, not its boxes: the union adopts
+candidate grids (grid-ref / split / append), and in a ground-truth
+decomposition, swapping our detection for GT boxes moves GTRM by only ~+0.5
+while swapping the reconstructed structure for GT moves it by +13.8–15.5.
+Region coverage was never the gap (22/22 above); cell structure is. Second,
+the finder's runtime was not where it looked: border geometry (intersections +
+cell assembly) is ~2% of `find_tables()` wall time, and the dominant cost
+turned out to be the accidental per-candidate TextPage rebuild of §4.4. With
+§4.4 fixed (−28%), what remains is character extraction and per-table header
+detection — content work any text-emitting detector pays in some form. A raft
+prefilter could therefore only shave the ~2% geometry slice, and rafts as the
+bbox source would forfeit the grids that carry the score. Rafts inside the
+hunt's own region proposal are, as we understand 1.28's hunter, already the
+direction MuPDF has taken; the remaining gap for this role is grid
+segmentation — asks (1)–(3) above.
 
 ---
 
