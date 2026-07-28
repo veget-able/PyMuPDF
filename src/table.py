@@ -181,12 +181,25 @@ FLAGS = (
     | pymupdf.TEXT_MEDIABOX_CLIP
 )
 # needed by mupdf function fz_find_table_within_bounds().
+# Matches the stext option set pymupdf-layout uses when extracting the page
+# (mutool draw -O preserve-images,preserve-whitespace,preserve-ligatures,
+# accurate-bboxes,vectors,collect-styles,segment,paragraph-break,structured,
+# clip,fuzzy-vectors,lazy-vectors), minus table-hunt: the bounded detector is
+# invoked explicitly per box instead of during textpage construction.
 TABLE_DETECTOR_FLAGS = (
     0
+    | pymupdf.TEXT_PRESERVE_IMAGES
+    | pymupdf.TEXT_PRESERVE_WHITESPACE
+    | pymupdf.TEXT_PRESERVE_LIGATURES
     | pymupdf.TEXT_ACCURATE_BBOXES
-    | pymupdf.TEXT_SEGMENT
     | pymupdf.TEXT_COLLECT_VECTORS
-    | pymupdf.TEXT_MEDIABOX_CLIP
+    | pymupdf.TEXT_COLLECT_STYLES
+    | pymupdf.TEXT_SEGMENT
+    | pymupdf.TEXT_PARAGRAPH_BREAK
+    | pymupdf.TEXT_COLLECT_STRUCTURE
+    | pymupdf.TEXT_CLIP
+    | pymupdf.TEXT_FUZZY_VECTORS
+    | pymupdf.TEXT_LAZY_VECTORS
 )
 white_spaces = set(string.whitespace)  # for checking white space only cells
 
