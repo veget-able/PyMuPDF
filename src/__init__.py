@@ -11569,6 +11569,9 @@ class Page:
 
     def find_tables(self, **kwargs):
         return table.find_tables(self, **kwargs)
+
+    def find_charts(self, **kwargs):
+        return chart.find_charts(self, **kwargs)
     
     @property
     def first_annot(self):
@@ -25798,6 +25801,7 @@ recover_line_quad           = utils.recover_line_quad
 recover_quad                = utils.recover_quad
 recover_span_quad           = utils.recover_span_quad
 
+from . import chart
 from . import table
 
 
