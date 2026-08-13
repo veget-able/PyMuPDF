@@ -1225,3 +1225,524 @@ def recover_char_quad(line_dir: tuple, span: dict, char: dict) -> pymupdf.Quad:
         raise ValueError("bad span argument")
 
     return recover_bbox_quad(line_dir, span, bbox)
+
+
+def _is_invisible_ocr_span(span: dict) -> bool:
+    """Return whether a span is an invisible OCR text-layer span."""
+    if span.get("font") == "GlyphLessFont":
+        return True
+    char_flags = span.get("char_flags", 0)
+    painted = (
+        pymupdf.mupdf.FZ_STEXT_STROKED
+        | pymupdf.mupdf.FZ_STEXT_FILLED
+    )
+    return not char_flags & painted
+
+
+def _recover_script_styles(blocks: list) -> None:
+    """Add a ``script`` style to geometrically raised or lowered spans."""
+    for block in blocks:
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", ()):
+            spans = [
+                span
+                for span in line.get("spans", ())
+                if span.get("text", "").strip()
+                and not _is_invisible_ocr_span(span)
+            ]
+            if len(spans) < 2:
+                continue
+            normal_size = max(span["size"] for span in spans)
+            baseline = max(
+                (
+                    span["origin"][1]
+                    for span in spans
+                    if span["size"] >= 0.95 * normal_size
+                ),
+                default=None,
+            )
+            if baseline is None:
+                continue
+            for span in spans:
+                text = span["text"].strip()
+                if (
+                    span["flags"] & pymupdf.TEXT_FONT_SUPERSCRIPT
+                    or len(text) > 10
+                    or not any(char.isalnum() for char in text)
+                    or span["size"] >= 0.85 * normal_size
+                ):
+                    continue
+                displacement = span["origin"][1] - baseline
+                if displacement < -0.1 * normal_size:
+                    span["script"] = "superscript"
+                elif displacement > 0.1 * normal_size:
+                    span["script"] = "subscript"
+
+
+def _style_vector_hlines(page: pymupdf.Page) -> list:
+    """Return thin, solid horizontal vector decorator candidates."""
+    hlines = []
+    for path in page.get_drawings():
+        items = path.get("items", ())
+        if len(items) != 1:
+            continue
+        dashes = (path.get("dashes") or "").replace(" ", "")
+        if dashes not in ("", "[]0"):
+            continue
+
+        item = items[0]
+        if item[0] == "l":
+            p0, p1 = item[1:3]
+            if abs(p0.y - p1.y) > 0.2:
+                continue
+            x0, x1 = sorted((p0.x, p1.x))
+            y = (p0.y + p1.y) / 2
+            width = path.get("width") or 0
+            color = path.get("color")
+        elif item[0] == "re":
+            rect = pymupdf.Rect(item[1])
+            if rect.height > 1.5:
+                continue
+            x0, x1 = rect.x0, rect.x1
+            y = (rect.y0 + rect.y1) / 2
+            width = max(path.get("width") or 0, rect.height)
+            color = path.get("fill") or path.get("color")
+        else:
+            continue
+
+        if x1 - x0 < 3 or width > 3:
+            continue
+        if (path.get("stroke_opacity") or 1) < 0.5 or (
+            path.get("fill_opacity") or 1
+        ) < 0.5:
+            continue
+        if color is not None and min(color) > 0.95:
+            continue
+        hlines.append((x0, y, x1, width))
+    return hlines
+
+
+def _style_is_ocr_page(blocks: list) -> bool:
+    spans = [
+        span
+        for block in blocks
+        if block.get("type") == 0
+        for line in block.get("lines", ())
+        for span in line.get("spans", ())
+        if span.get("text", "").strip()
+    ]
+    if not spans:
+        return False
+    return sum(_is_invisible_ocr_span(span) for span in spans) / len(spans) >= 0.8
+
+
+def _style_pixel_hlines(page: pymupdf.Page, blocks: list, dpi: int) -> list:
+    """Return solid horizontal raster-line candidates in page coordinates."""
+    if not _style_is_ocr_page(blocks):
+        return []
+
+    pix = page.get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY, alpha=False)
+    scale = dpi / 72
+    active_rows = set()
+    for block in blocks:
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", ()):
+            if abs(line.get("dir", (1, 0))[0] - 1) > 1e-3:
+                continue
+            for span in line.get("spans", ()):
+                if not span.get("text", "").strip() or not _is_invisible_ocr_span(span):
+                    continue
+                baseline = span["origin"][1]
+                size = span["size"]
+                y0 = max(0, round((baseline - 0.08 * size) * scale) - pix.y)
+                y1 = min(
+                    pix.height - 1,
+                    round((baseline + 0.42 * size) * scale) - pix.y,
+                )
+                active_rows.update(range(y0, y1 + 1))
+
+    samples = pix.samples_mv
+    gap = max(1, round(dpi / 75))
+    min_length = max(3, round(30 * scale))
+    max_length = round(0.72 * pix.width)
+    row_runs = []
+    for y in sorted(active_rows):
+        offset = y * pix.stride
+        indexes = [x for x in range(pix.width) if samples[offset + x] < 200]
+        if not indexes:
+            continue
+        starts = [0]
+        stops = []
+        for pos in range(1, len(indexes)):
+            if indexes[pos] - indexes[pos - 1] > gap + 1:
+                stops.append(pos)
+                starts.append(pos)
+        stops.append(len(indexes))
+        for start, stop in zip(starts, stops):
+            x0 = indexes[start]
+            x1 = indexes[stop - 1] + 1
+            length = x1 - x0
+            if min_length <= length <= max_length and (stop - start) / length >= 0.70:
+                row_runs.append((y, x0, x1))
+
+    if not row_runs:
+        return []
+
+    parents = list(range(len(row_runs)))
+
+    def root(item):
+        while parents[item] != item:
+            parents[item] = parents[parents[item]]
+            item = parents[item]
+        return item
+
+    def union(left, right):
+        left_root = root(left)
+        right_root = root(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    rows_to_runs = {}
+    for index, (y, x0, x1) in enumerate(row_runs):
+        for other in rows_to_runs.get(y - 1, ()):
+            _, other_x0, other_x1 = row_runs[other]
+            overlap = min(x1, other_x1) - max(x0, other_x0)
+            shorter = min(x1 - x0, other_x1 - other_x0)
+            if overlap >= 0.10 * shorter:
+                union(index, other)
+        rows_to_runs.setdefault(y, []).append(index)
+
+    grouped = {}
+    for index, run in enumerate(row_runs):
+        grouped.setdefault(root(index), []).append(run)
+
+    hlines = []
+    max_vertical_span = max(2, round(4 * scale))
+    max_thickness = max(2, round(2 * scale))
+    for component in grouped.values():
+        rows = sorted({item[0] for item in component})
+        if len(rows) < 2 or rows[-1] - rows[0] + 1 > max_vertical_span:
+            continue
+        x0 = min(item[1] for item in component)
+        x1 = max(item[2] for item in component)
+        thickness = sum(item[2] - item[1] for item in component) / (x1 - x0)
+        if thickness > max_thickness:
+            continue
+
+        solid_ratio = 0
+        for row in rows:
+            offset = row * pix.stride
+            indexes = [
+                x
+                for x in range(x0, x1)
+                if samples[offset + x] < 200
+            ]
+            if not indexes:
+                continue
+            longest = 1
+            current = 1
+            for pos in range(1, len(indexes)):
+                if indexes[pos] == indexes[pos - 1] + 1:
+                    current += 1
+                    longest = max(longest, current)
+                else:
+                    current = 1
+            solid_ratio = max(solid_ratio, longest / (x1 - x0))
+        if solid_ratio < 0.50:
+            continue
+
+        y = sum(rows) / len(rows)
+        pdf_y = (y + pix.y) / scale
+        if pdf_y >= 0.90 * page.rect.height:
+            continue
+        hlines.append(
+            ((x0 + pix.x) / scale, pdf_y, (x1 + pix.x) / scale, thickness / scale)
+        )
+
+    return [
+        hline
+        for hline in hlines
+        if sum(abs(other[1] - hline[1]) <= 50 for other in hlines) <= 12
+    ]
+
+
+def _style_raw_chars(raw_blocks: list) -> list:
+    chars = []
+    for block in raw_blocks:
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", ()):
+            if abs(line.get("dir", (1, 0))[0] - 1) > 1e-3:
+                continue
+            for span in line.get("spans", ()):
+                for char in span.get("chars", ()):
+                    item = dict(char)
+                    item["size"] = span["size"]
+                    item["char_flags"] = span["char_flags"]
+                    chars.append(item)
+    return chars
+
+
+def _style_span_chars(span: dict, raw_chars: list) -> list:
+    bbox = pymupdf.Rect(span["bbox"])
+    baseline = span["origin"][1]
+    size = span["size"]
+    chars = []
+    seen = set()
+    for char in raw_chars:
+        char_bbox = pymupdf.Rect(char["bbox"])
+        center_x = (char_bbox.x0 + char_bbox.x1) / 2
+        if not bbox.x0 - 0.1 <= center_x <= bbox.x1 + 0.1:
+            continue
+        if abs(char["origin"][1] - baseline) > max(0.5, 0.1 * size):
+            continue
+        key = (char["c"], tuple(char["bbox"]), tuple(char["origin"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        chars.append(char)
+    chars.sort(key=lambda char: (char["origin"][0], char["bbox"][0]))
+    if "".join(char["c"] for char in chars) != span["text"]:
+        return []
+    return chars
+
+
+def _apply_recovered_decorators(
+    blocks: list,
+    raw_blocks: list,
+    hlines: list,
+    *,
+    underline_only: bool = False,
+) -> None:
+    if not blocks or not raw_blocks or not hlines:
+        return
+
+    raw_chars = _style_raw_chars(raw_blocks)
+    owners = []
+    spans = []
+    for block in blocks:
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", ()):
+            for span in line.get("spans", ()):
+                owners.append(line)
+                spans.append(span)
+    mapped = [_style_span_chars(span, raw_chars) for span in spans]
+    char_refs = [
+        (span_no, char_no, char)
+        for span_no, chars in enumerate(mapped)
+        for char_no, char in enumerate(chars)
+    ]
+    if not char_refs:
+        return
+
+    strike = pymupdf.mupdf.FZ_STEXT_STRIKEOUT
+    underline = pymupdf.mupdf.FZ_STEXT_UNDERLINE
+    underline_lower = -0.42 if underline_only else -0.30
+    underline_upper = 0.02 if underline_only else 0.08
+    recovered = {strike: set(), underline: set()}
+    touched = {strike: set(), underline: set()}
+
+    for x0, y, x1, width in hlines:
+        possible = {underline: []} if underline_only else {strike: [], underline: []}
+        for span_no, char_no, char in char_refs:
+            char_bbox = pymupdf.Rect(char["bbox"])
+            center_x = (char_bbox.x0 + char_bbox.x1) / 2
+            if not x0 - 0.1 <= center_x <= x1 + 0.1:
+                continue
+            size = char["size"]
+            relative_y = (char["origin"][1] - y) / size
+            if not underline_only and 0.15 <= relative_y <= 0.65:
+                possible[strike].append(
+                    (span_no, char_no, char, abs(relative_y - 0.28))
+                )
+            elif underline_lower <= relative_y <= underline_upper:
+                possible[underline].append(
+                    (span_no, char_no, char, abs(relative_y + 0.12))
+                )
+
+        choices = [
+            (sum(item[3] for item in items) / len(items), flag, items)
+            for flag, items in possible.items()
+            if items and any(item[2]["c"].isalnum() for item in items)
+        ]
+        if not choices:
+            continue
+        _, flag, items = min(choices, key=lambda item: item[0])
+        covered = [pymupdf.Rect(item[2]["bbox"]) for item in items]
+        text_x0 = min(rect.x0 for rect in covered)
+        text_x1 = max(rect.x1 for rect in covered)
+        sizes = sorted(item[2]["size"] for item in items)
+        size = sizes[len(sizes) // 2]
+        tolerance = max(1.5, 0.35 * size)
+
+        # A rule above and another below the same text commonly delimit a
+        # byline, cell, or form field. Reject the lower rule when its parallel
+        # partner has no text of its own in a decorator band. Consecutive real
+        # underlines are retained because the partner aligns with the adjacent
+        # text line.
+        paired_container_rule = False
+        for other_x0, other_y, other_x1, _ in hlines:
+            separation = y - other_y
+            if not 0.5 * size <= separation <= 2 * size:
+                continue
+            if abs(other_x0 - x0) > tolerance or abs(other_x1 - x1) > tolerance:
+                continue
+            partner_has_text = False
+            for _, _, other_char in char_refs:
+                other_bbox = pymupdf.Rect(other_char["bbox"])
+                other_center = (other_bbox.x0 + other_bbox.x1) / 2
+                if not other_x0 - 0.1 <= other_center <= other_x1 + 0.1:
+                    continue
+                other_relative_y = (
+                    other_char["origin"][1] - other_y
+                ) / other_char["size"]
+                if (
+                    0.15 <= other_relative_y <= 0.65
+                    or underline_lower <= other_relative_y <= underline_upper
+                ):
+                    partner_has_text = True
+                    break
+            if not partner_has_text:
+                paired_container_rule = True
+                break
+        if paired_container_rule:
+            continue
+
+        if text_x0 - x0 > tolerance or x1 - text_x1 > tolerance:
+            continue
+        if width > max(1.5 if underline_only else 1.0, 0.15 * size):
+            continue
+
+        selected = {(item[0], item[1]) for item in items}
+        if underline_only:
+            additions = set()
+            for span_no, char_no, char in char_refs:
+                if char["c"].isalnum() or char["c"].isspace():
+                    continue
+                if not (
+                    (span_no, char_no - 1) in selected
+                    or (span_no, char_no + 1) in selected
+                ):
+                    continue
+                char_bbox = pymupdf.Rect(char["bbox"])
+                relative_y = (char["origin"][1] - y) / char["size"]
+                if (
+                    underline_lower <= relative_y <= underline_upper
+                    and char_bbox.x1 >= x0 - 0.1
+                    and char_bbox.x0 <= x1 + 0.1
+                ):
+                    additions.add((span_no, char_no))
+            selected.update(additions)
+        recovered[flag].update(selected)
+
+        for span_no, _, char in char_refs:
+            char_bbox = pymupdf.Rect(char["bbox"])
+            relative_y = (char["origin"][1] - y) / char["size"]
+            aligned = (
+                flag == strike
+                and 0.15 <= relative_y <= 0.65
+                or flag == underline
+                and underline_lower <= relative_y <= underline_upper
+            )
+            if aligned and char_bbox.x1 >= x0 - 0.1 and char_bbox.x0 <= x1 + 0.1:
+                touched[flag].add(span_no)
+
+    for span_no, span in enumerate(spans):
+        chars = mapped[span_no]
+        if not chars or not any(span_no in touched[flag] for flag in touched):
+            continue
+        pieces = []
+        for char_no, char in enumerate(chars):
+            flags = char["char_flags"]
+            if underline_only:
+                flags |= span["char_flags"] & (strike | underline)
+            for flag in (strike, underline):
+                if span_no not in touched[flag]:
+                    continue
+                if underline_only and flag == underline and flags & underline:
+                    continue
+                flags &= ~flag
+                if (span_no, char_no) in recovered[flag]:
+                    flags |= flag
+            if pieces and pieces[-1][0] == flags:
+                pieces[-1][1].append(char)
+            else:
+                pieces.append([flags, [char]])
+
+        if len(pieces) == 1 and pieces[0][0] == span["char_flags"]:
+            # The guarded rendered-line check can confirm a native MuPDF
+            # decorator without changing its flags.  Record that provenance
+            # so downstream consumers can distinguish the confirmed boundary
+            # from incidental native flags caused by descenders or table
+            # rules.
+            span["recovered_style"] = True
+            continue
+
+        replacements = []
+        for flags, piece_chars in pieces:
+            piece_text = "".join(char["c"] for char in piece_chars)
+            if not piece_text.strip():
+                continue
+            replacement = dict(span)
+            replacement["text"] = piece_text
+            replacement["char_flags"] = flags
+            replacement["bbox"] = tuple(piece_chars[0]["bbox"])
+            rect = pymupdf.Rect(replacement["bbox"])
+            for char in piece_chars[1:]:
+                rect |= pymupdf.Rect(char["bbox"])
+            replacement["bbox"] = tuple(rect)
+            replacement["origin"] = tuple(piece_chars[0]["origin"])
+            replacement["recovered_style"] = True
+            replacements.append(replacement)
+
+        owner = owners[span_no]
+        position = owner["spans"].index(span)
+        owner["spans"][position : position + 1] = replacements
+
+
+def recover_text_styles(
+    page: pymupdf.Page,
+    blocks: list = None,
+    *,
+    textpage: pymupdf.TextPage = None,
+    raster: bool = False,
+    dpi: int = 300,
+) -> list:
+    """Recover rendered text styles in extracted ``dict`` blocks.
+
+    The returned object is *blocks*, updated in place. Thin vector decorators
+    are aligned to RAWDICT character geometry and represented with MuPDF's
+    standard underline / strikeout ``char_flags``. If ``raster`` is true,
+    straight underlines on invisible OCR text layers are recovered from a
+    grayscale page rendering. Small baseline-shifted spans receive a ``script``
+    value of ``"superscript"`` or ``"subscript"``.
+
+    This function creates style metadata only. It deliberately does not choose
+    an output markup or serialize text.
+    """
+    pymupdf.CheckParent(page)
+    own_textpage = textpage is None
+    if textpage is None:
+        textpage = page.get_textpage(flags=pymupdf.TEXT_COLLECT_STYLES)
+    elif getattr(textpage, "parent", None) != page:
+        raise ValueError("not a textpage of this page")
+    if blocks is None:
+        blocks = textpage.extractDICT()["blocks"]
+    raw_blocks = textpage.extractRAWDICT()["blocks"]
+
+    _apply_recovered_decorators(blocks, raw_blocks, _style_vector_hlines(page))
+    if raster:
+        _apply_recovered_decorators(
+            blocks,
+            raw_blocks,
+            _style_pixel_hlines(page, blocks, dpi),
+            underline_only=True,
+        )
+    _recover_script_styles(blocks)
+
+    if own_textpage:
+        textpage = None
+    return blocks

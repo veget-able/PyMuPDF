@@ -25897,6 +25897,7 @@ recover_char_quad           = utils.recover_char_quad
 recover_line_quad           = utils.recover_line_quad
 recover_quad                = utils.recover_quad
 recover_span_quad           = utils.recover_span_quad
+recover_text_styles         = utils.recover_text_styles
 
 from . import table
 
