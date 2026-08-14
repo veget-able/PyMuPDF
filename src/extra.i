@@ -3016,7 +3016,11 @@ static int detect_super_script(fz_stext_line *line, fz_stext_char *ch)
 static int JM_char_font_flags(fz_font *font, fz_stext_line *line, fz_stext_char *ch)
 {
     int flags = detect_super_script(line, ch);
-    flags += mupdf::ll_fz_font_is_italic(font) * TEXT_FONT_ITALIC;
+    /* Synthetic italic (text-matrix shear or mupdf's fake italic) renders
+     * slanted with an upright font: fold it into the italic style bit so
+     * extraction matches rendering. */
+    flags += (mupdf::ll_fz_font_is_italic(font)
+              || (ch->flags & FZ_STEXT_SYNTHETIC_ITALIC) != 0) * TEXT_FONT_ITALIC;
     flags += mupdf::ll_fz_font_is_serif(font) * TEXT_FONT_SERIFED;
     flags += mupdf::ll_fz_font_is_monospaced(font) * TEXT_FONT_MONOSPACED;
     flags += mupdf::ll_fz_font_is_bold(font) * TEXT_FONT_BOLD;
