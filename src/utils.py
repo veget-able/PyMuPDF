@@ -1240,43 +1240,32 @@ def _is_invisible_ocr_span(span: dict) -> bool:
 
 
 def _recover_script_styles(blocks: list) -> None:
-    """Add a ``script`` style to geometrically raised or lowered spans."""
+    """Map MuPDF's line-level script char flags to span ``script`` metadata.
+
+    Detection lives in MuPDF's structured-text assembly (see
+    FZ_STEXT_SUPERSCRIPT / FZ_STEXT_SUBSCRIPT): characters drawn in a
+    clearly reduced size clearly off the line's full-size baseline are
+    flagged there, with direction-aware geometry so rotated text works.
+    This helper only translates those flags into the ``script`` value
+    this API promises. Requires a textpage extracted with
+    FZ_STEXT_COLLECT_STYLES (the default here); without it no flags are
+    present and no metadata is added.
+    """
+    sup = getattr(pymupdf.mupdf, "FZ_STEXT_SUPERSCRIPT", 0)
+    sub = getattr(pymupdf.mupdf, "FZ_STEXT_SUBSCRIPT", 0)
+    if not (sup or sub):
+        return
     for block in blocks:
         if block.get("type") != 0:
             continue
         for line in block.get("lines", ()):
-            spans = [
-                span
-                for span in line.get("spans", ())
-                if span.get("text", "").strip()
-                and not _is_invisible_ocr_span(span)
-            ]
-            if len(spans) < 2:
-                continue
-            normal_size = max(span["size"] for span in spans)
-            baseline = max(
-                (
-                    span["origin"][1]
-                    for span in spans
-                    if span["size"] >= 0.95 * normal_size
-                ),
-                default=None,
-            )
-            if baseline is None:
-                continue
-            for span in spans:
-                text = span["text"].strip()
-                if (
-                    span["flags"] & pymupdf.TEXT_FONT_SUPERSCRIPT
-                    or len(text) > 10
-                    or not any(char.isalnum() for char in text)
-                    or span["size"] >= 0.85 * normal_size
-                ):
+            for span in line.get("spans", ()):
+                if span["flags"] & pymupdf.TEXT_FONT_SUPERSCRIPT:
                     continue
-                displacement = span["origin"][1] - baseline
-                if displacement < -0.1 * normal_size:
+                char_flags = span.get("char_flags", 0)
+                if char_flags & sup:
                     span["script"] = "superscript"
-                elif displacement > 0.1 * normal_size:
+                elif char_flags & sub:
                     span["script"] = "subscript"
 
 

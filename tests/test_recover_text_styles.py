@@ -88,49 +88,24 @@ def test_recover_text_styles_generates_metadata_not_markup():
 
 
 def test_recover_text_styles_generates_script_metadata():
+    # Detection now lives in MuPDF's line assembly, so draw real text:
+    # a full-size H and O with a reduced, lowered 2 between them (H2O).
     doc = pymupdf.open()
     page = doc.new_page()
-    blocks = [
-        {
-            "type": 0,
-            "lines": [
-                {
-                    "spans": [
-                        {
-                            "text": "H",
-                            "size": 20,
-                            "origin": (72, 100),
-                            "flags": 0,
-                            "font": "Helvetica",
-                            "char_flags": pymupdf.mupdf.FZ_STEXT_FILLED,
-                        },
-                        {
-                            "text": "2",
-                            "size": 10,
-                            "origin": (84, 105),
-                            "flags": 0,
-                            "font": "Helvetica",
-                            "char_flags": pymupdf.mupdf.FZ_STEXT_FILLED,
-                        },
-                        {
-                            "text": "O",
-                            "size": 20,
-                            "origin": (90, 100),
-                            "flags": 0,
-                            "font": "Helvetica",
-                            "char_flags": pymupdf.mupdf.FZ_STEXT_FILLED,
-                        },
-                    ]
-                }
-            ],
-        }
+    page.insert_text((72, 100), "H", fontsize=20)
+    page.insert_text((85, 105), "2", fontsize=10)
+    page.insert_text((92, 100), "O", fontsize=20)
+    blocks = pymupdf.recover_text_styles(page)
+    spans = [
+        span
+        for block in blocks
+        for line in block.get("lines", ())
+        for span in line.get("spans", ())
     ]
-
-    pymupdf.recover_text_styles(page, blocks)
-    spans = blocks[0]["lines"][0]["spans"]
-    assert spans[1]["script"] == "subscript"
-    assert "script" not in spans[0]
-    assert "script" not in spans[2]
+    scripts = {span["text"].strip(): span.get("script") for span in spans}
+    assert scripts.get("2") == "subscript"
+    assert scripts.get("H") is None
+    assert scripts.get("O") is None
 
 
 def test_recover_text_styles_does_not_infer_script_from_ocr_geometry():
