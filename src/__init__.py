@@ -12050,16 +12050,21 @@ class Page:
             return  Identity # nothing to do
 
         # need to derotate the page's content
+        # The rotation matrix is expressed in the visible page coordinate
+        # system.  An offset CropBox therefore needs to anchor the
+        # compensation: using the MediaBox origin can move flattened content
+        # outside the visible page.
         mb = self.mediabox  # current mediabox
+        cb = self.cropbox  # current visible page box
 
         if rot == 90:
             # before derotation, shift content horizontally
-            mat0 = Matrix(1, 0, 0, 1, mb.y1 - mb.x1 - mb.x0 - mb.y0, 0)
+            mat0 = Matrix(1, 0, 0, 1, cb.y1 - cb.x1 - cb.x0 - cb.y0, 0)
         elif rot == 270:
             # before derotation, shift content vertically
-            mat0 = Matrix(1, 0, 0, 1, 0, mb.x1 - mb.y1 - mb.y0 - mb.x0)
+            mat0 = Matrix(1, 0, 0, 1, 0, cb.x1 - cb.y1 - cb.y0 - cb.x0)
         else:  # rot = 180
-            mat0 = Matrix(1, 0, 0, 1, -2 * mb.x0, -2 * mb.y0)
+            mat0 = Matrix(1, 0, 0, 1, -2 * cb.x0, -2 * cb.y0)
 
         # prefix with derotation matrix
         mat = mat0 * self.derotation_matrix
@@ -12075,6 +12080,9 @@ class Page:
             mb.x1 = y1
             mb.y1 = x1
             self.set_mediabox(mb)
+            # set_mediabox resets CropBox. Keep the visible rectangle in the
+            # flattened page coordinate system.
+            self.set_cropbox(Rect(cb.y0, cb.x0, cb.y1, cb.x1))
 
         self.set_rotation(0)
         rot = ~mat  # inverse of the derotation matrix
