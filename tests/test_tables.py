@@ -227,6 +227,38 @@ def test_strict_lines():
     assert tab2.col_count < tab1.col_count
 
 
+def test_strict_lines_accepts_thin_rects_batched_in_large_fill_path():
+    """Line-like rect items survive a large fill-only path's bbox filter."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=240, height=180)
+    shape = page.new_shape()
+    x_values = (40, 120, 200)
+    y_values = (30, 90, 150)
+    for x in x_values:
+        shape.draw_rect(pymupdf.Rect(x - 0.4, y_values[0], x + 0.4, y_values[-1]))
+    for y in y_values:
+        shape.draw_rect(pymupdf.Rect(x_values[0], y - 0.4, x_values[-1], y + 0.4))
+    shape.finish(color=None, fill=(0, 0, 0))
+    shape.commit()
+    for row in range(2):
+        for col in range(2):
+            page.insert_text(
+                (x_values[col] + 10, y_values[row] + 25),
+                f"r{row}c{col}",
+            )
+
+    paths = page.get_drawings()
+    assert len(paths) == 1
+    assert paths[0]["type"] == "f"
+    assert paths[0]["rect"].width > 3 and paths[0]["rect"].height > 3
+
+    tables = page.find_tables(strategy="lines_strict", use_layout=False).tables
+    assert len(tables) == 1
+    assert tables[0].row_count == 2
+    assert tables[0].col_count == 2
+    doc.close()
+
+
 def test_add_lines():
     """Test new parameter add_lines for table recognition."""
     if platform.python_implementation() == 'GraalVM':

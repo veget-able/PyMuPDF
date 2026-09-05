@@ -2424,20 +2424,42 @@ def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes
         else:  # accept passed-in vector graphics
             allpaths = npaths[:]  # paths relevant for table detection
         paths = []
+        bbox_paths = []
         for p in allpaths:
-            # If only looking at lines, we ignore fill-only paths,
-            # except simulated lines (i.e. small width or height).
+            # If only looking at lines, ignore large fill-only paths, but
+            # retain line-like rectangle items inside them. Some producers
+            # batch hundreds of thin grid-rule rectangles into one fill path;
+            # its aggregate path bbox is large even though every relevant
+            # item is a simulated horizontal or vertical line.
             if (
                 lines_strict
                 and p["type"] == "f"
                 and p["rect"].width > snap_x
                 and p["rect"].height > snap_y
             ):
+                line_items = []
+                for item in p["items"]:
+                    if item[0] != "re":
+                        continue
+                    rect = item[1].normalize()
+                    if (
+                        rect.width <= min_length
+                        and rect.width < rect.height
+                    ) or (
+                        rect.height <= min_length
+                        and rect.height < rect.width
+                    ):
+                        line_items.append(item)
+                if line_items:
+                    line_path = p.copy()
+                    line_path["items"] = line_items
+                    paths.append(line_path)
                 continue
             paths.append(p)
+            bbox_paths.append(p)
 
         # start with all vector graphics rectangles
-        prects = sorted(set([p["rect"] for p in paths]), key=lambda r: (r.y1, r.x0))
+        prects = sorted(set([p["rect"] for p in bbox_paths]), key=lambda r: (r.y1, r.x0))
         new_rects = []  # the final list of joined rectangles
         # ----------------------------------------------------------------
         # Strategy: Join rectangles that "almost touch" each other.
