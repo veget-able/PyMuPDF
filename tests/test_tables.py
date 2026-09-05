@@ -939,3 +939,29 @@ def test_find_tables_union_no_layout_degrades_to_line_candidates():
     finally:
         pymupdf._get_layout = original_get_layout_fn
         doc.close()
+
+
+def test_find_tables_union_forwards_virtual_lines_to_candidates():
+    """Virtual raster-style rules reach the nested line finder in union mode."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=400, height=400)
+    for row, y in enumerate((100, 140)):
+        for col, x in enumerate((80, 180)):
+            page.insert_text((x + 8, y + 24), f"r{row}c{col}")
+    page.layout_information = []
+    lines = [
+        ((80, y), (280, y)) for y in (100, 140, 180)
+    ] + [
+        ((x, 100), (x, 180)) for x in (80, 180, 280)
+    ]
+    try:
+        tables = page.find_tables(
+            use_layout=True,
+            union=True,
+            add_lines=lines,
+        ).tables
+        assert len(tables) == 1
+        assert (tables[0].row_count, tables[0].col_count) == (2, 2)
+        assert tables[0].extract()[1][1] == "r1c1"
+    finally:
+        doc.close()

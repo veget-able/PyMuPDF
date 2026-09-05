@@ -88,18 +88,26 @@ def _layout_table_grids(page):
     return grids
 
 
-def _union_line_candidates(page):
+def _union_line_candidates(page, *, add_lines=None, add_boxes=None):
     """Line-based table candidates for the union stage as ``(bbox, grid)`` pairs.
 
     Runs a nested find_tables (strategy=_UNION_STRATEGY, use_layout=False) and
     keeps each detected table's bbox and row-major cell grid (Table.rows, None
-    for a gap), deduped by rounded bbox. Returns ``(candidates, finder)``; the
+    for a gap), deduped by rounded bbox. Caller-supplied virtual lines / boxes
+    are forwarded to that nested finder so they participate in the same union
+    decisions as PDF-native vector rules. Returns ``(candidates, finder)``; the
     finder is reused as the returned TableFinder shell.
     """
     # Imported here, not at module top, to break the import cycle: this
     # module is itself imported lazily by table.find_tables (union path).
     from pymupdf.table import find_tables
-    finder = find_tables(page, strategy=_UNION_STRATEGY, use_layout=False)
+    finder = find_tables(
+        page,
+        strategy=_UNION_STRATEGY,
+        use_layout=False,
+        add_lines=add_lines,
+        add_boxes=add_boxes,
+    )
     candidates = []
     seen = set()
     for tab in (getattr(finder, "tables", None) or []):
@@ -325,7 +333,7 @@ def _union_replace_append(existing, candidates, *, page, grid_ref, grid_ref_iou,
     return entries
 
 
-def _find_tables_union(page):
+def _find_tables_union(page, *, add_lines=None, add_boxes=None):
     """Detect a page's tables by fusing layout grids with line-based candidates.
 
     Ensures the raw layout (computed only when page.layout_information is None,
@@ -336,7 +344,11 @@ def _find_tables_union(page):
     if page.layout_information is None:
         page.get_layout(return_raw=True)
     primaries = _layout_table_grids(page)
-    candidates, finder = _union_line_candidates(page)
+    candidates, finder = _union_line_candidates(
+        page,
+        add_lines=add_lines,
+        add_boxes=add_boxes,
+    )
     entries = _union_replace_append(
         primaries,
         candidates,

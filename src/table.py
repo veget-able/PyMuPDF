@@ -2934,7 +2934,11 @@ def find_tables(
             # the nested finder. Imported here, not at module top, to avoid an
             # import cycle: _table_union imports find_tables back from this module.
             from pymupdf._table_union import _find_tables_union
-            tbf = _find_tables_union(page)
+            tbf = _find_tables_union(
+                page,
+                add_lines=add_lines,
+                add_boxes=add_boxes,
+            )
             TEXTPAGE = tbf.textpage
         else:
             boxes = []
