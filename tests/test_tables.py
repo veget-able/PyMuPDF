@@ -708,6 +708,56 @@ def test_find_tables_refine_splits_rows_default_unchanged():
         doc.close()
 
 
+def test_refine_repeated_leading_header_cuts_exact_signature():
+    """A normalized multi-column header near the top can split stacked tables."""
+    rows = [
+        ["First table", "", ""],
+        ["Effective Date", "BI", "PD"],
+        ["2024-01-01", "1", "2"],
+        ["2024-02-01", "3", "4"],
+        ["2024-03-01", "5", "6"],
+        ["Second table", "", ""],
+        [" effective   date ", "bi", "PD"],
+        ["2023-01-01", "7", "8"],
+        ["2023-02-01", "9", "10"],
+        ["2023-03-01", "11", "12"],
+    ]
+    assert pymupdf.table._refine_repeated_leading_header_cuts(rows) == (6,)
+
+
+def test_refine_repeated_leading_header_cuts_rejects_body_and_short_segments():
+    """Repeated body data and adjacent duplicates must leave the table intact."""
+    repeated_body = [
+        ["Report", "", ""],
+        ["Name", "Value", "Note"],
+        ["a", "1", "x"],
+        ["same", "record", "value"],
+        ["b", "2", "y"],
+        ["c", "3", "z"],
+        ["d", "4", "w"],
+        ["same", "record", "value"],
+        ["e", "5", "q"],
+        ["f", "6", "r"],
+        ["g", "7", "s"],
+        ["h", "8", "t"],
+    ]
+    adjacent_duplicate = [
+        ["Name", "Value", "Note"],
+        ["a", "1", "x"],
+        ["b", "2", "y"],
+        ["c", "3", "z"],
+        ["Name", "Value", "Note"],
+        ["Name", "Value", "Note"],
+        ["d", "4", "w"],
+        ["e", "5", "q"],
+        ["f", "6", "r"],
+        ["g", "7", "s"],
+    ]
+    split = pymupdf.table._refine_repeated_leading_header_cuts
+    assert split(repeated_body) == ()
+    assert split(adjacent_duplicate) == ()
+
+
 def _make_merged_header_page():
     """A page whose line grid detects a header cell that spans both body columns.
 

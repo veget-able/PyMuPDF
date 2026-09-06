@@ -2810,6 +2810,56 @@ def _refine_placements_text_grid(grid):
     return [[collapse_cell_ws(cell.text) for cell in row] for row in grid]
 
 
+def _refine_repeated_leading_header_cuts(rows):
+    """Return conservative split rows for an exactly repeated leading header.
+
+    Only a multi-column signature in the first three rows is eligible.  Exact
+    case-insensitive repeats must leave at least four rows in every segment, so
+    ordinary repeated body values and adjacent duplicate rows do not split a
+    table.
+    """
+    normalized = [
+        tuple(collapse_cell_ws(text).casefold() for text in row)
+        for row in rows
+    ]
+    for seed_index in range(min(3, len(normalized))):
+        signature = normalized[seed_index]
+        nonempty = [text for text in signature if text]
+        if len(nonempty) < 3:
+            continue
+        if sum(any(char.isalpha() for char in text) for text in nonempty) < 2:
+            continue
+        repeats = [
+            row_index
+            for row_index in range(seed_index + 4, len(normalized))
+            if normalized[row_index] == signature
+        ]
+        if not repeats:
+            continue
+        boundaries = [0, *repeats, len(normalized)]
+        if all(
+            end - start >= 4
+            for start, end in zip(boundaries, boundaries[1:])
+        ):
+            return tuple(repeats)
+    return ()
+
+
+def _refine_split_repeated_leading_headers(page, working):
+    """Split a refined grid at exact recurrences of its leading header row."""
+    try:
+        placements = _refine_placement_or_flat_grid(page, working)
+        cuts = _refine_repeated_leading_header_cuts(
+            _refine_placements_text_grid(placements)
+        )
+    except Exception:
+        return [working]
+    if not cuts:
+        return [working]
+    boundaries = (0, *cuts, len(working))
+    return [working[start:end] for start, end in zip(boundaries, boundaries[1:])]
+
+
 def _refine_tag_grid(grid, top_header_rows):
     """Set each placement's HTML tag in place: cells in the top header rows
     become ``th``; every other cell becomes ``td``."""
@@ -3028,17 +3078,39 @@ def find_tables(
                 working = refine_grid_structure(page, grid, table_bbox=tab.bbox)
                 body_start = _refine_body_start_row(page, working)
                 working = refine_grid_rows(page, working, header_row_count=body_start)
-                flat = _refine_grid_to_cells(working)
-                # Preserve an explicit reported-bbox override (union grid-ref
-                # tables): the refined grid must not change the reported region.
-                new_tab = Table(page, flat, bbox=tab._bbox) if flat else tab
-                # Build the tagged model on `working` directly, not on the
-                # re-gridded new_tab.cells, so placements match the refined grid.
-                placements, region = _refine_build_placements(page, working, body_start)
-                new_tab.placements = placements
-                new_tab.header_rows = region.top_header_rows
-                new_tab.section_rows = region.section_header_rows
-                refined_tables.append(new_tab)
+                segments = (
+                    _refine_split_repeated_leading_headers(page, working)
+                    if union
+                    else [working]
+                )
+                was_split = len(segments) > 1
+                for segment in segments:
+                    flat = _refine_grid_to_cells(segment)
+                    # An unsplit union grid-ref retains its explicit reported
+                    # layout bbox. Split tables use their segment-cell unions.
+                    new_tab = (
+                        Table(
+                            page,
+                            flat,
+                            bbox=None if was_split else tab._bbox,
+                        )
+                        if flat
+                        else tab
+                    )
+                    segment_body_start = (
+                        _refine_body_start_row(page, segment)
+                        if was_split
+                        else body_start
+                    )
+                    # Build the tagged model on `segment` directly, not on the
+                    # re-gridded new_tab.cells, so placements match its grid.
+                    placements, region = _refine_build_placements(
+                        page, segment, segment_body_start
+                    )
+                    new_tab.placements = placements
+                    new_tab.header_rows = region.top_header_rows
+                    new_tab.section_rows = region.section_header_rows
+                    refined_tables.append(new_tab)
             tbf.tables = refined_tables
     except Exception as e:
         pymupdf.message("find_tables: exception occurred: %s" % str(e))
