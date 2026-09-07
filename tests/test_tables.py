@@ -948,6 +948,31 @@ def _make_bordered_table(page, x0, y0, texts):
             page.insert_text((cx + 5, ry + 14), texts[r][c])
 
 
+def _make_bordered_grid(page, bbox, texts):
+    """Draw a uniformly divided grid with the same shape as ``texts``."""
+    x0, y0, x1, y1 = bbox
+    row_count = len(texts)
+    col_count = len(texts[0])
+    row_height = (y1 - y0) / row_count
+    col_width = (x1 - x0) / col_count
+    for row in range(row_count + 1):
+        y = y0 + row * row_height
+        page.draw_line((x0, y), (x1, y))
+    for column in range(col_count + 1):
+        x = x0 + column * col_width
+        page.draw_line((x, y0), (x, y1))
+    for row, values in enumerate(texts):
+        for column, value in enumerate(values):
+            if value:
+                page.insert_text(
+                    (
+                        x0 + column * col_width + 5,
+                        y0 + row * row_height + min(14, row_height - 3),
+                    ),
+                    value,
+                )
+
+
 def test_find_tables_union_fuses_layout_grid_with_line_candidate():
     """find_tables(union=True) fuses the layout analyzer's GNN table grids with
     the line-based finder's candidates: a layout table with no matching line
@@ -1045,5 +1070,138 @@ def test_find_tables_union_forwards_virtual_lines_to_candidates():
         assert len(tables) == 1
         assert (tables[0].row_count, tables[0].col_count) == (2, 2)
         assert tables[0].extract()[1][1] == "r1c1"
+    finally:
+        doc.close()
+
+
+def test_find_tables_union_rejects_one_dimensional_content_without_area_gate():
+    """A one-dimensional grid must not absorb separate Layout groups."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=500, height=500)
+    _make_bordered_grid(page, (80, 80, 180, 120), [["left0", ""], ["left1", ""]])
+    page.layout_information = [
+        {"class_name": "text", "group_bbox": [82.0, 82.0, 125.0, 98.0]},
+        {"class_name": "text", "group_bbox": [82.0, 102.0, 125.0, 118.0]},
+    ]
+    try:
+        assert page.find_tables(use_layout=True, union=True).tables == []
+    finally:
+        doc.close()
+
+
+def test_find_tables_union_keeps_compact_single_row_content_grid():
+    """A complete one-row record is valid without repeated row support."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=500, height=500)
+    _make_bordered_grid(page, (80, 80, 380, 104), [["a", "b", "c"]])
+    page.layout_information = []
+    try:
+        tables = page.find_tables(use_layout=True, union=True).tables
+        assert len(tables) == 1
+        assert tables[0].extract() == [["a", "b", "c"]]
+    finally:
+        doc.close()
+
+
+def test_find_tables_union_keeps_complete_spanning_header_grid():
+    """A complete colspan header plus record row has two-dimensional support."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=500, height=500)
+    page.draw_rect((80, 80, 280, 140))
+    page.draw_line((80, 110), (280, 110))
+    page.draw_line((180, 110), (180, 140))
+    page.insert_text((85, 99), "header")
+    page.insert_text((85, 129), "a")
+    page.insert_text((185, 129), "b")
+    page.layout_information = []
+    try:
+        assert len(page.find_tables(use_layout=True, union=True).tables) == 1
+    finally:
+        doc.close()
+
+
+def test_find_tables_union_rejects_multiline_single_row_panel():
+    """A one-row partition around a whole picture is not emitted as a table."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=500, height=500)
+    _make_bordered_grid(
+        page,
+        (80, 80, 380, 240),
+        [["left\naxis\nlabels", "right\naxis\nlabels"]],
+    )
+    page.layout_information = [
+        {"class_name": "picture", "group_bbox": [80.0, 80.0, 380.0, 240.0]},
+    ]
+    try:
+        assert page.find_tables(use_layout=True, union=True).tables == []
+    finally:
+        doc.close()
+
+
+def test_find_tables_union_keeps_table_subregion_inside_larger_picture():
+    """A line grid inside a larger picture can be a raster table subregion."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=500, height=500)
+    _make_bordered_grid(
+        page,
+        (160, 180, 340, 240),
+        [["left\nlabels", ""]],
+    )
+    page.layout_information = [
+        {"class_name": "picture", "group_bbox": [120.0, 80.0, 380.0, 360.0]},
+    ]
+    try:
+        tables = page.find_tables(use_layout=True, union=True).tables
+        assert len(tables) == 1
+        assert (tables[0].row_count, tables[0].col_count) == (1, 2)
+    finally:
+        doc.close()
+
+
+def test_find_tables_union_keeps_multiline_multirow_picture_table():
+    """Picture content does not veto a candidate with a two-row grid."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=500, height=500)
+    _make_bordered_grid(
+        page,
+        (80, 80, 380, 240),
+        [["left\nlabels", ""], ["second\nrow", ""]],
+    )
+    page.layout_information = [
+        {"class_name": "picture", "group_bbox": [80.0, 80.0, 380.0, 240.0]},
+    ]
+    try:
+        tables = page.find_tables(use_layout=True, union=True).tables
+        assert len(tables) == 1
+        assert (tables[0].row_count, tables[0].col_count) == (2, 2)
+    finally:
+        doc.close()
+
+
+def test_find_tables_union_keeps_one_coherent_table_group_without_content_support():
+    """One Layout table group is retained; ownership is not a rejection gate."""
+    import types
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=500, height=500)
+    _make_bordered_grid(
+        page,
+        (80, 80, 380, 240),
+        [["left\naxis\nlabels", "right\naxis\nlabels"]],
+    )
+    page.layout_information = [
+        {
+            "class_name": "table",
+            "group_bbox": [80.0, 80.0, 380.0, 240.0],
+            "table_grid": types.SimpleNamespace(
+                h_lines=[50.0, 100.0],
+                v_lines=[150.0],
+            ),
+        }
+    ]
+    try:
+        tables = page.find_tables(use_layout=True, union=True).tables
+        assert len(tables) == 1
+        assert (tables[0].row_count, tables[0].col_count) == (1, 2)
     finally:
         doc.close()

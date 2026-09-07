@@ -53,6 +53,9 @@ _UNION_GRID_REF_SPAN_MULT_GATE = True     # reject under-segmented candidate gri
 _UNION_GRID_REF_SPAN_MULT_THRESHOLD = 3.0  # max horizontally-separated span groups per cell
 _UNION_OWNER_CONTAINMENT = 0.85           # min containment for a split candidate's owner
 _UNION_OWNER_AMBIGUOUS_OVERLAP = 0.25     # overlap above which an unowned candidate is suppressed
+_UNION_CONTENT_MIN_DENSE_ROWS = 2         # rows with text in at least two cells
+_UNION_CONTENT_MIN_REPEATED_COLS = 2      # columns with text in at least two rows
+_UNION_CONTENT_SINGLE_ROW_MAX_LINES = 2   # one record row may wrap once
 
 
 def _layout_table_grids(page):
@@ -171,6 +174,206 @@ def _union_find_owner(candidate_bbox, existing_bboxes):
         elif candidate_containment >= _UNION_OWNER_AMBIGUOUS_OVERLAP or existing_coverage >= _UNION_OWNER_AMBIGUOUS_OVERLAP:
             ambiguous = True
     return best_owner, ambiguous
+
+
+def _union_text_line_count(intervals):
+    """Count visual text lines from character ``(top, bottom)`` intervals."""
+    if not intervals:
+        return 0
+    count = 0
+    band_top = band_bottom = None
+    for top, bottom in sorted(intervals):
+        if band_top is None:
+            band_top, band_bottom = top, bottom
+            count = 1
+        elif min(bottom, band_bottom) > max(top, band_top):
+            band_top = min(band_top, top)
+            band_bottom = max(band_bottom, bottom)
+        else:
+            band_top, band_bottom = top, bottom
+            count += 1
+    return count
+
+
+def _union_grid_has_2d_content_support(grid):
+    """Whether a line grid has content distributed like a serializable table.
+
+    The primary signal is repeated two-dimensional text. Two bounded topology
+    forms cover grids whose missing horizontal rules hide that repetition:
+    complete colspan grids (for example a spanning header plus one record row),
+    and complete single record rows containing at most one wrapped line.
+
+    Character midpoints follow ``Table.extract()``'s half-open cell-membership
+    rule. ``None`` grid slots are span/gap placeholders, not empty text cells.
+    The decision is candidate-local; page area, Layout ownership, file identity,
+    benchmark GT and virtual-line provenance are not inputs.
+    """
+    populated = []
+    line_counts = []
+    for row in grid:
+        populated_row = []
+        line_count_row = []
+        for cell in row:
+            if cell is None:
+                populated_row.append(False)
+                line_count_row.append(0)
+                continue
+            rect = pymupdf.Rect(cell)
+            if rect.is_empty:
+                populated_row.append(False)
+                line_count_row.append(0)
+                continue
+            matched_intervals = []
+            for char in CHARS:
+                if not str(char.get("text") or "").strip():
+                    continue
+                try:
+                    h_mid = (float(char["x0"]) + float(char["x1"])) / 2.0
+                    v_mid = (float(char["top"]) + float(char["bottom"])) / 2.0
+                    top = float(char["top"])
+                    bottom = float(char["bottom"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if (
+                    h_mid >= float(rect.x0)
+                    and h_mid < float(rect.x1)
+                    and v_mid >= float(rect.y0)
+                    and v_mid < float(rect.y1)
+                ):
+                    matched_intervals.append((top, bottom))
+            populated_row.append(bool(matched_intervals))
+            line_count_row.append(_union_text_line_count(matched_intervals))
+        populated.append(populated_row)
+        line_counts.append(line_count_row)
+
+    dense_rows = sum(sum(row) >= 2 for row in populated)
+    max_columns = max((len(row) for row in populated), default=0)
+    repeated_columns = sum(
+        sum(column < len(row) and row[column] for row in populated) >= 2
+        for column in range(max_columns)
+    )
+    if (
+        dense_rows >= _UNION_CONTENT_MIN_DENSE_ROWS
+        and repeated_columns >= _UNION_CONTENT_MIN_REPEATED_COLS
+    ):
+        return True
+
+    content_rows = [index for index, row in enumerate(populated) if any(row)]
+
+    # A spanning cell is measured against the most explicit row's concrete-cell
+    # centers. This distinguishes a real colspan from a None gap in an irregular
+    # grid without treating every placeholder as populated.
+    reference_row = max(
+        grid,
+        key=lambda row: sum(cell is not None for cell in row),
+        default=[],
+    )
+    column_probes = sorted(
+        (float(rect.x0) + float(rect.x1)) / 2.0
+        for cell in reference_row
+        if cell is not None
+        for rect in (pymupdf.Rect(cell),)
+        if not rect.is_empty
+    )
+
+    if len(content_rows) >= 2 and len(content_rows) == len(grid):
+        all_concrete_cells_populated = all(
+            populated[row_index][column_index]
+            for row_index, row in enumerate(grid)
+            for column_index, cell in enumerate(row)
+            if cell is not None
+        )
+        has_multicell_row = any(
+            sum(populated[row_index]) >= 2 for row_index in content_rows
+        )
+        has_populated_colspan = any(
+            populated[row_index][column_index]
+            and sum(float(rect.x0) <= x < float(rect.x1) for x in column_probes) >= 2
+            for row_index, row in enumerate(grid)
+            for column_index, cell in enumerate(row)
+            if cell is not None
+            for rect in (pymupdf.Rect(cell),)
+            if not rect.is_empty
+        )
+        if (
+            all_concrete_cells_populated
+            and has_multicell_row
+            and has_populated_colspan
+        ):
+            return True
+
+    # A one-record/header-row table has no repeated row dimension to measure.
+    # Admit it only when every concrete cell is populated and its text is at
+    # most two visual lines. Empty artifact rows are ignored; long chart/prose
+    # panels therefore fail on their per-cell line structure.
+    if len(content_rows) == 1:
+        row_index = content_rows[0]
+        concrete_columns = [
+            column_index
+            for column_index, cell in enumerate(grid[row_index])
+            if cell is not None
+        ]
+        if (
+            len(concrete_columns) >= 2
+            and all(populated[row_index][column] for column in concrete_columns)
+            and max(line_counts[row_index][column] for column in concrete_columns)
+            <= _UNION_CONTENT_SINGLE_ROW_MAX_LINES
+        ):
+            return True
+
+    return False
+
+
+def _union_candidate_conflicts_with_layout(page, candidate_bbox, grid):
+    """Whether an unsupported candidate would replace independent content.
+
+    Two or more Layout groups are already separate semantic regions. A single
+    picture is not itself a conflict: raster tables and picture-bearing cells
+    are valid table content. Reject the picture case only when the line finder
+    has produced a one-row partition around the whole picture. Such a candidate
+    has neither repeated two-dimensional content nor a second row in its grid;
+    it is the chart / panel false-positive shape this guard is meant to catch.
+
+    A candidate that is merely a subregion of a larger picture remains eligible
+    for raster-table recovery. Zero groups deliberately remains eligible for
+    the GNN-missed-table recovery path, as does one coherent non-picture group.
+    """
+    contained_groups = []
+    for group in (page.layout_information or []):
+        if not isinstance(group, dict):
+            continue
+        group_bbox = group.get("group_bbox")
+        if not group_bbox:
+            continue
+        try:
+            rect = pymupdf.Rect(group_bbox[:4])
+        except (TypeError, ValueError):
+            continue
+        if rect.is_empty:
+            continue
+        h_mid = (float(rect.x0) + float(rect.x1)) / 2.0
+        v_mid = (float(rect.y0) + float(rect.y1)) / 2.0
+        if (
+            h_mid >= float(candidate_bbox.x0)
+            and h_mid < float(candidate_bbox.x1)
+            and v_mid >= float(candidate_bbox.y0)
+            and v_mid < float(candidate_bbox.y1)
+        ):
+            contained_groups.append((group.get("class_name"), rect))
+            if len(contained_groups) >= 2:
+                return True
+
+    if len(contained_groups) != 1 or contained_groups[0][0] != "picture":
+        return False
+    if len(grid) != 1:
+        return False
+    picture_rect = contained_groups[0][1]
+    return (
+        float(picture_rect.x0) >= float(candidate_bbox.x0)
+        and float(picture_rect.y0) >= float(candidate_bbox.y0)
+        and float(picture_rect.x1) <= float(candidate_bbox.x1)
+        and float(picture_rect.y1) <= float(candidate_bbox.y1)
+    )
 
 
 def _union_text_span_rects(page):
@@ -349,6 +552,14 @@ def _find_tables_union(page, *, add_lines=None, add_boxes=None):
         add_lines=add_lines,
         add_boxes=add_boxes,
     )
+    candidates = [
+        candidate
+        for candidate in candidates
+        if _union_grid_has_2d_content_support(candidate[1])
+        or not _union_candidate_conflicts_with_layout(
+            page, candidate[0], candidate[1]
+        )
+    ]
     entries = _union_replace_append(
         primaries,
         candidates,
