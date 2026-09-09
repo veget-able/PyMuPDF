@@ -3097,6 +3097,15 @@ def find_tables(
                         if flat
                         else tab
                     )
+                    provenance = dict(getattr(tab, "bbox_provenance", {}))
+                    if was_split:
+                        provenance.update(
+                            bbox_source="find_tables",
+                            bbox_operation="refine_split",
+                            parent_bbox_source=provenance.get("bbox_source", "unknown"),
+                            parent_bbox=list(tab.bbox),
+                        )
+                    new_tab.bbox_provenance = provenance
                     segment_body_start = (
                         _refine_body_start_row(page, segment)
                         if was_split

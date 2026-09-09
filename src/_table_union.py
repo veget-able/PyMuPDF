@@ -58,6 +58,21 @@ _UNION_CONTENT_MIN_REPEATED_COLS = 2      # columns with text in at least two ro
 _UNION_CONTENT_SINGLE_ROW_MAX_LINES = 2   # one record row may wrap once
 
 
+class _TableGridEntry(tuple):
+    """Unchanged (bbox, grid) pair carrying provenance from the actual branch."""
+
+    def __new__(cls, bbox, grid, provenance):
+        entry = super().__new__(cls, (bbox, grid))
+        entry.bbox_provenance = dict(provenance)
+        return entry
+
+
+def _entry_with_provenance(entry, **updates):
+    provenance = dict(getattr(entry, "bbox_provenance", {}))
+    provenance.update(updates)
+    return _TableGridEntry(entry[0], entry[1], provenance)
+
+
 def _layout_table_grids(page):
     """Primary table grids from the raw layout analyzer result.
 
@@ -67,7 +82,7 @@ def _layout_table_grids(page):
     layout (reading) order. Boxes without a usable grid are skipped.
     """
     grids = []
-    for group in (page.layout_information or []):
+    for raw_index, group in enumerate(page.layout_information or []):
         if not isinstance(group, dict):
             # The union path needs the raw (return_raw=True) layout form; the
             # normalized [x0, y0, x1, y1, class] tuples carry no table_grid.
@@ -87,7 +102,10 @@ def _layout_table_grids(page):
             for j in range(len(v_lines) - 1):
                 row.append((v_lines[j], h_lines[i], v_lines[j + 1], h_lines[i + 1]))
             grid.append(row)
-        grids.append((pymupdf.Rect(group_bbox[:4]), grid))
+        grids.append(_TableGridEntry(pymupdf.Rect(group_bbox[:4]), grid, {
+            "bbox_source": "gnn", "grid_source": "tgif",
+            "bbox_operation": "gnn_detection", "source_gnn_indices": [raw_index],
+        }))
     return grids
 
 
@@ -127,7 +145,10 @@ def _union_line_candidates(page, *, add_lines=None, add_boxes=None):
         if key in seen:
             continue
         seen.add(key)
-        candidates.append((bbox, grid))
+        candidates.append(_TableGridEntry(bbox, grid, {
+            "bbox_source": "find_tables", "grid_source": "find_tables",
+            "bbox_operation": "line_detection", "source_gnn_indices": [],
+        }))
     return candidates, finder
 
 
@@ -526,13 +547,20 @@ def _union_replace_append(existing, candidates, *, page, grid_ref, grid_ref_iou,
     entries = []
     for index, entry in enumerate(existing):
         if index in final_replacements:
-            entries.extend(final_replacements[index])
+            parent = getattr(entry, "bbox_provenance", {})
+            entries.extend(_entry_with_provenance(
+                candidate, bbox_operation="union_split",
+                source_gnn_indices=parent.get("source_gnn_indices", []),
+            ) for candidate in final_replacements[index])
         elif index in grid_refs:
             # Grid-ref: keep the primary's (layout) bbox, take the candidate grid.
-            entries.append((entry[0], grid_refs[index][1]))
+            provenance = dict(getattr(entry, "bbox_provenance", {}))
+            provenance.update(grid_source="find_tables", bbox_operation="grid_ref")
+            entries.append(_TableGridEntry(entry[0], grid_refs[index][1], provenance))
         else:
-            entries.append(entry)
-    entries.extend(append_candidates)
+            entries.append(_entry_with_provenance(entry, bbox_operation="gnn_keep"))
+    entries.extend(_entry_with_provenance(candidate, bbox_operation="union_append")
+                   for candidate in append_candidates)
     return entries
 
 
@@ -578,10 +606,13 @@ def _find_tables_union(page, *, add_lines=None, add_boxes=None):
         CHARS.clear()
         finder = TableFinder(page)
     tables = []
-    for bbox, grid in entries:
+    for entry in entries:
+        bbox, grid = entry
         flat = [cell for row in grid for cell in row if cell is not None]
         if not flat:
             continue
-        tables.append(Table(page, flat, bbox=bbox))
+        table = Table(page, flat, bbox=bbox)
+        table.bbox_provenance = dict(getattr(entry, "bbox_provenance", {}))
+        tables.append(table)
     finder.tables = tables
     return finder
