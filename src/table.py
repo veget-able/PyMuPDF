@@ -95,6 +95,7 @@ from pymupdf._table_refine import (
     _refine_cells_to_grid,
     _refine_grid_to_cells,
     _refine_page_words,
+    _WORD_INDEX_CACHE,
 )
 from pymupdf._table_spans import (
     resolve_spans,
@@ -135,9 +136,11 @@ def _html_table_scope():
     """
     token = _HTML_TABLES_ONLY.set(True)
     drawings_token = _TABLE_DRAWINGS.set({})
+    words_token = _WORD_INDEX_CACHE.set({})
     try:
         yield
     finally:
+        _WORD_INDEX_CACHE.reset(words_token)
         _TABLE_DRAWINGS.reset(drawings_token)
         _HTML_TABLES_ONLY.reset(token)
 

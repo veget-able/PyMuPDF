@@ -36,6 +36,7 @@ import pymupdf
 from pymupdf._table_refine import (
     _refine_is_vertical_or_rotated,
     _refine_page_words,
+    _word_candidates,
 )
 
 
@@ -298,7 +299,7 @@ def _span_select_words_in_rect(page_words, rect):
     The index is what lets resolve_spans claim each page word for exactly one
     placement (an earlier cell's word is not re-claimed by a later one)."""
     selected = []
-    for index, word in enumerate(page_words):
+    for index, word in _word_candidates(page_words, rect):
         wx0, wy0, wx1, wy1, text = word
         if not str(text).strip():
             continue
