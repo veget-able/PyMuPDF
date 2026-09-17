@@ -414,31 +414,47 @@ def _union_candidate_conflicts_with_layout(page, candidate_bbox, grid):
     )
 
 
-def _union_text_span_rects(page):
-    """Non-empty page text-span rects, cached on the page.
+def _union_text_span_records(page):
+    """Shared (rect, text) input for split coherence and span multiplicity.
 
-    Drives the grid-ref span-multiplicity gate: every non-blank span as a bare
-    rect."""
-    cached = getattr(page, "_union_text_spans_cache", None)
+    Cache lifetime matches the existing page-local span cache. Consumers must
+    not reuse the page's cached extraction across a changed text/geometry state.
+    Keep empty rectangles here: each consumer retains its original filtering.
+    """
+    cached = getattr(page, "_union_text_span_records_cache", None)
     if cached is not None:
         return cached
     spans = []
     for block in page.get_text("dict").get("blocks", []) or []:
         for line in block.get("lines", []) or []:
             for span in line.get("spans", []) or []:
-                if not str(span.get("text") or "").strip():
+                text = str(span.get("text") or "").strip()
+                if not text:
                     continue
                 bbox = span.get("bbox")
                 if not bbox:
                     continue
                 rect = pymupdf.Rect(bbox)
-                if not rect.is_empty:
-                    spans.append(rect)
+                spans.append((rect, text))
+    try:
+        setattr(page, "_union_text_span_records_cache", spans)
+    except Exception:
+        pass
+    return spans
+
+
+def _union_text_span_rects(page):
+    """Non-empty rectangle view of the shared page text-span records."""
+    cached = getattr(page, "_union_text_spans_cache", None)
+    if cached is not None:
+        return cached
+    spans = [rect for rect, _text in _union_text_span_records(page) if not rect.is_empty]
     try:
         setattr(page, "_union_text_spans_cache", spans)
     except Exception:
         pass
     return spans
+
 
 
 def _union_cell_span_group_count(cell, text_spans):
