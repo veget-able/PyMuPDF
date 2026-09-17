@@ -4,6 +4,9 @@ Local branch: `review/table-vall-20260917`.
 Base: `a2aea0af189911f632168f0ecbff32e70b2de01f` (benchmark source).
 No remote push or PR has been performed.
 
+Per-feature contracts, dependencies and removal effects:
+[Table feature specification](docs/table-features.md).
+
 ## Scope and review order
 
 1. Virtual line/box forwarding and thin filled rectangle conversion.
