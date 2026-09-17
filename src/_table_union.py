@@ -30,7 +30,11 @@ TableFinder and _iou come from pymupdf.table; find_tables is imported lazily.
 
 import pymupdf
 
-from pymupdf.table import CHARS, EDGES, Table, TableFinder, _iou
+from pymupdf.table import CHARS, EDGES, Table, TableFinder, _iou, _cells_to_rows
+
+
+# Optional evidence policy, not an additional P1. The isolated runner scopes it.
+_UNION_RULING_FILTER = None
 
 
 # ---------------------------------------------------------------------------
@@ -122,33 +126,46 @@ def _union_line_candidates(page, *, add_lines=None, add_boxes=None):
     # Imported here, not at module top, to break the import cycle: this
     # module is itself imported lazily by table.find_tables (union path).
     from pymupdf.table import find_tables
+    candidates = []
+
+    def admit(live_page, groups):
+        # Match the old bbox dedup order BEFORE P1, not after rejection.
+        kept, seen = [], set()
+        for cells in groups:
+            bbox = pymupdf.Rect(
+                min(c[0] for c in cells), min(c[1] for c in cells),
+                max(c[2] for c in cells), max(c[3] for c in cells))
+            if bbox.is_empty:
+                continue
+            grid = [row.cells for row in _cells_to_rows(cells)]
+            if not grid:
+                continue
+            key = tuple(round(value) for value in bbox)
+            if key in seen:
+                continue
+            seen.add(key)
+            if not (_union_grid_has_2d_content_support(grid)
+                    or not _union_candidate_conflicts_with_layout(live_page, bbox, grid)):
+                continue
+            kept.append(cells)
+            candidates.append(_TableGridEntry(bbox, grid, {
+                "bbox_source": "find_tables", "grid_source": "find_tables",
+                "bbox_operation": "line_detection", "source_gnn_indices": [],
+            }))
+        return kept
+
     finder = find_tables(
         page,
         strategy=_UNION_STRATEGY,
         use_layout=False,
         add_lines=add_lines,
         add_boxes=add_boxes,
+        _cell_group_filter=admit,
+        _ruling_filter=_UNION_RULING_FILTER,
     )
-    candidates = []
-    seen = set()
-    for tab in (getattr(finder, "tables", None) or []):
-        try:
-            bbox = pymupdf.Rect(tab.bbox)
-        except (ValueError, TypeError):
-            continue
-        if bbox.is_empty:
-            continue
-        grid = [[cell for cell in row.cells] for row in (tab.rows or [])]
-        if not grid:
-            continue
-        key = tuple(round(value) for value in bbox)
-        if key in seen:
-            continue
-        seen.add(key)
-        candidates.append(_TableGridEntry(bbox, grid, {
-            "bbox_source": "find_tables", "grid_source": "find_tables",
-            "bbox_operation": "line_detection", "source_gnn_indices": [],
-        }))
+    if finder is None:
+        # Nested detection failure must not leak partially admitted candidates.
+        candidates.clear()
     return candidates, finder
 
 
@@ -580,14 +597,6 @@ def _find_tables_union(page, *, add_lines=None, add_boxes=None):
         add_lines=add_lines,
         add_boxes=add_boxes,
     )
-    candidates = [
-        candidate
-        for candidate in candidates
-        if _union_grid_has_2d_content_support(candidate[1])
-        or not _union_candidate_conflicts_with_layout(
-            page, candidate[0], candidate[1]
-        )
-    ]
     entries = _union_replace_append(
         primaries,
         candidates,

@@ -1607,6 +1607,19 @@ class TableHeader:
         self.external = above
 
 
+def _cells_to_rows(cells):
+    """Canonical row ordering and None slots for Table and union admission."""
+    _sorted = sorted(cells, key=itemgetter(1, 0))
+    xs = list(sorted(set(map(itemgetter(0), cells))))
+    rows = []
+    for y, row_cells in itertools.groupby(_sorted, itemgetter(1)):
+        xdict = {cell[0]: cell for cell in row_cells}
+        row = TableRow([xdict.get(x) for x in xs])
+        rows.append(row)
+    return rows
+
+
+
 class Table:
     def __init__(self, page, cells, bbox=None):
         self.page = page
@@ -1639,14 +1652,7 @@ class Table:
 
     @property
     def rows(self) -> list:
-        _sorted = sorted(self.cells, key=itemgetter(1, 0))
-        xs = list(sorted(set(map(itemgetter(0), self.cells))))
-        rows = []
-        for y, row_cells in itertools.groupby(_sorted, itemgetter(1)):
-            xdict = {cell[0]: cell for cell in row_cells}
-            row = TableRow([xdict.get(x) for x in xs])
-            rows.append(row)
-        return rows
+        return _cells_to_rows(self.cells)
 
     @property
     def row_count(self) -> int:  # PyMuPDF extension
@@ -2153,7 +2159,7 @@ class TableFinder:
     https://github.com/tabulapdf/tabula-extractor/issues/16
     """
 
-    def __init__(self, page, settings=None):
+    def __init__(self, page, settings=None, *, cell_group_filter=None):
         self.page = weakref.proxy(page)
         self.textpage = None
         self.settings = TableSettings.resolve(settings)
@@ -2164,10 +2170,10 @@ class TableFinder:
             self.settings.intersection_y_tolerance,
         )
         self.cells = intersections_to_cells(self.intersections)
-        self.tables = [
-            Table(self.page, cell_group)
-            for cell_group in cells_to_tables(self.page, self.cells)
-        ]
+        groups = cells_to_tables(self.page, self.cells)
+        if cell_group_filter is not None:
+            groups = cell_group_filter(self.page, groups)
+        self.tables = [Table(self.page, group) for group in groups]
 
     def get_edges(self) -> list:
         settings = self.settings
@@ -2935,6 +2941,8 @@ def find_tables(
     use_layout: bool = True,  # gate line-based tables by layout table boxes
     union: bool = False,  # opt-in: fuse layout grids with line-based candidates
     refine: bool = False,  # opt-in: refine each detected table's cell grid
+    _cell_group_filter=None,  # internal union admission, before Table construction
+    _ruling_filter=None,  # internal union evidence policy; standalone defaults unchanged
 ):
     """Detect and extract tables on a page.
 
@@ -3055,7 +3063,7 @@ def find_tables(
                 add_boxes=add_boxes,
             )  # create lines and curves
 
-            tbf = TableFinder(page, settings=tset)
+            tbf = TableFinder(page, settings=tset, cell_group_filter=_cell_group_filter)
             tbf.textpage = TEXTPAGE  # store textpage for later use
             if boxes:
                 # only keep Finder tables that match a layout box
