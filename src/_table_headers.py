@@ -936,41 +936,37 @@ def escape_html_text(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _cell_inner(text: str) -> str:
-    """A cell's inner HTML: escaped non-empty lines joined by ``<br/>``."""
-    return "<br/>".join(escape_html_text(part.strip()) for part in text.splitlines() if part.strip())
+def _table_output_rows(rows, section_header_rows=()):
+    """Yield the effective output cells without serializing them.
 
-
-def render_table_html(rows, section_header_rows=()) -> str:
-    """Serialize a tagged placement grid to its final ``<table>`` HTML in one pass.
-
-    ``rows`` is a row-major grid of cells duck-typed with ``text`` / ``colspan``
-    / ``rowspan`` / ``tag`` (e.g. :class:`pymupdf.table.SpanCell`): each cell
-    emits its tag, its ``colspan`` / ``rowspan`` attributes and its ``<br/>``-
-    joined escaped inner HTML. A row whose index is in ``section_header_rows``
-    and that carries a single non-empty label collapses to one
-    ``<th colspan=N>`` spanning the row."""
+    Each cell is (tag, text_lines, colspan, rowspan). The final HTML writer
+    and structural consumers share section collapse and line trimming here.
+    Input cells are never modified; ordinary intra-line whitespace is kept.
+    """
     section_rows = set(section_header_rows or ())
-    parts = ["<table>"]
     for row_idx, cells in enumerate(rows):
         if row_idx in section_rows:
             nonempty = [collapse_cell_ws(cell.text) for cell in cells if collapse_cell_ws(cell.text)]
             if len(nonempty) == 1 and len(cells) >= 2:
-                parts.append(
-                    '<tr><th colspan="%d">%s</th></tr>'
-                    % (len(cells), escape_html_text(nonempty[0]))
-                )
+                yield [("th", (nonempty[0],), len(cells), 1)]
                 continue
+        yield [(cell.tag, tuple(part.strip() for part in cell.text.splitlines() if part.strip()),
+                cell.colspan, cell.rowspan) for cell in cells]
+
+
+def render_table_html(rows, section_header_rows=()) -> str:
+    """Serialize the shared output-cell view as the final table HTML."""
+    parts = ["<table>"]
+    for cells in _table_output_rows(rows, section_header_rows):
         parts.append("<tr>")
-        for cell in cells:
+        for tag, lines, colspan, rowspan in cells:
             attrs = ""
-            if cell.colspan > 1:
-                attrs += ' colspan="%d"' % cell.colspan
-            if cell.rowspan > 1:
-                attrs += ' rowspan="%d"' % cell.rowspan
-            parts.append(
-                "<%s%s>%s</%s>" % (cell.tag, attrs, _cell_inner(cell.text), cell.tag)
-            )
+            if colspan > 1:
+                attrs += ' colspan="%d"' % colspan
+            if rowspan > 1:
+                attrs += ' rowspan="%d"' % rowspan
+            inner = "<br/>".join(escape_html_text(part) for part in lines)
+            parts.append("<%s%s>%s</%s>" % (tag, attrs, inner, tag))
         parts.append("</tr>")
     parts.append("</table>")
     return "".join(parts)
