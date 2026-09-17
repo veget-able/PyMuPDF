@@ -542,12 +542,38 @@ def _union_one_to_one_grid_refs(existing, candidates, *, iou_threshold, page, sp
     return refs, consumed
 
 
-def _union_replace_append(existing, candidates, *, page, grid_ref, grid_ref_iou, span_mult_gate, span_mult_threshold):
+class _UnionSelection:
+    """One union call's chosen entries, shared by coherence and recovery.
+
+    Parent keys follow the adapters' existing provenance contract (including
+    last-parent-wins for repeated keys). Normal split groups share the same
+    child list in both views; concatenation keeps mixed/repeated keys separate.
+    No grid, model result, or page state is copied or cached here.
+    """
+    def __init__(self):
+        self.parents = {}
+        self.split_groups = {}
+        self.recovery_groups = {}
+
+    def add(self, parent, children, *, split=False):
+        key = tuple(getattr(parent, "bbox_provenance", {}).get("source_gnn_indices", []))
+        self.parents[key] = parent
+        if children is None:
+            return
+        previous = self.recovery_groups.get(key)
+        self.recovery_groups[key] = children if previous is None else previous + children
+        if split:
+            previous = self.split_groups.get(key)
+            self.split_groups[key] = children if previous is None else previous + children
+
+
+def _union_replace_append(existing, candidates, *, page, grid_ref, grid_ref_iou, span_mult_gate, span_mult_threshold, _selection=None):
     """Fuse primary and candidate ``(bbox, grid)`` entries.
 
     Applies grid-ref replacement, split replacement (>=2 candidates owned by one
     primary replace it, ordered by y0/x0) and append of unowned candidates,
-    returning the fused entry list in the contractual order."""
+    returning the fused entry list in the contractual order. Optional private
+    ``_selection`` carries the same chosen entries to the adapter consumers."""
     existing_bboxes = [entry[0] for entry in existing]
     if grid_ref:
         grid_refs, consumed = _union_one_to_one_grid_refs(
@@ -579,19 +605,24 @@ def _union_replace_append(existing, candidates, *, page, grid_ref, grid_ref_iou,
     }
     entries = []
     for index, entry in enumerate(existing):
+        chosen = None
         if index in final_replacements:
             parent = getattr(entry, "bbox_provenance", {})
-            entries.extend(_entry_with_provenance(
+            chosen = [_entry_with_provenance(
                 candidate, bbox_operation="union_split",
                 source_gnn_indices=parent.get("source_gnn_indices", []),
-            ) for candidate in final_replacements[index])
+            ) for candidate in final_replacements[index]]
+            entries.extend(chosen)
         elif index in grid_refs:
             # Grid-ref: keep the primary's (layout) bbox, take the candidate grid.
             provenance = dict(getattr(entry, "bbox_provenance", {}))
             provenance.update(grid_source="find_tables", bbox_operation="grid_ref")
-            entries.append(_TableGridEntry(entry[0], grid_refs[index][1], provenance))
+            chosen = [_TableGridEntry(entry[0], grid_refs[index][1], provenance)]
+            entries.extend(chosen)
         else:
             entries.append(_entry_with_provenance(entry, bbox_operation="gnn_keep"))
+        if _selection is not None:
+            _selection.add(entry, chosen, split=index in final_replacements)
     entries.extend(_entry_with_provenance(candidate, bbox_operation="union_append")
                    for candidate in append_candidates)
     return entries
