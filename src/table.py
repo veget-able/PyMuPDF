@@ -2483,8 +2483,11 @@ def _collect_graphic_evidence(page, npaths, *, snap_x, snap_y, min_length,
 
 
 
-def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes=None):
-    edges = EDGES._list()  # bind once: avoid per-append proxy overhead below
+def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes=None,
+               ruling_filter=None):
+    # Convert each input once. The optional union policy consumes these same
+    # native/virtual edges before synthesized envelopes enter the edge stream.
+    edges, origins = [], []
     snap_x = tset.snap_x_tolerance
     snap_y = tset.snap_y_tolerance
     min_length = tset.edge_min_length
@@ -2568,6 +2571,11 @@ def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes
         }
         return line_dict
 
+    def append_native(line, item, line_like):
+        edges.append(line_to_edge(line))
+        if ruling_filter is not None:
+            origins.append((item, line_like))
+
     for p in paths:
         items = p["items"]  # items in this path
 
@@ -2576,6 +2584,7 @@ def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes
             items.append(("l", items[-1][2], items[0][1]))
 
         for i in items:
+            line_like = i[0] == "l"
             if i[0] not in ("l", "re", "qu"):
                 continue  # ignore anything else
 
@@ -2583,7 +2592,7 @@ def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes
                 p1, p2 = i[1:]
                 line_dict = make_line(p, p1, p2, clip)
                 if line_dict:
-                    edges.append(line_to_edge(line_dict))
+                    append_native(line_dict, i, line_like)
 
             elif i[0] == "re":
                 # A rectangle: decompose into 4 lines, but filter out
@@ -2593,62 +2602,104 @@ def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes
                 if (
                     rect.width <= min_length and rect.width < rect.height
                 ):  # simulates a vertical line
+                    line_like = True
                     x = abs(rect.x1 + rect.x0) / 2  # take middle value for x
                     p1 = pymupdf.Point(x, rect.y0)
                     p2 = pymupdf.Point(x, rect.y1)
                     line_dict = make_line(p, p1, p2, clip)
                     if line_dict:
-                        edges.append(line_to_edge(line_dict))
+                        append_native(line_dict, i, line_like)
                     continue
 
                 if (
                     rect.height <= min_length and rect.height < rect.width
                 ):  # simulates a horizontal line
+                    line_like = True
                     y = abs(rect.y1 + rect.y0) / 2  # take middle value for y
                     p1 = pymupdf.Point(rect.x0, y)
                     p2 = pymupdf.Point(rect.x1, y)
                     line_dict = make_line(p, p1, p2, clip)
                     if line_dict:
-                        edges.append(line_to_edge(line_dict))
+                        append_native(line_dict, i, line_like)
                     continue
 
                 line_dict = make_line(p, rect.tl, rect.bl, clip)
                 if line_dict:
-                    edges.append(line_to_edge(line_dict))
+                    append_native(line_dict, i, line_like)
 
                 line_dict = make_line(p, rect.bl, rect.br, clip)
                 if line_dict:
-                    edges.append(line_to_edge(line_dict))
+                    append_native(line_dict, i, line_like)
 
                 line_dict = make_line(p, rect.br, rect.tr, clip)
                 if line_dict:
-                    edges.append(line_to_edge(line_dict))
+                    append_native(line_dict, i, line_like)
 
                 line_dict = make_line(p, rect.tr, rect.tl, clip)
                 if line_dict:
-                    edges.append(line_to_edge(line_dict))
+                    append_native(line_dict, i, line_like)
 
             else:  # must be a quad
                 # we convert it into (up to) 4 lines
                 ul, ur, ll, lr = i[1]
+                xs = {p.x for p in (ul, ur, ll, lr)}
+                ys = {p.y for p in (ul, ur, ll, lr)}
+                line_like = (len(xs) == len(ys) == 2
+                             and min(max(xs)-min(xs), max(ys)-min(ys)) <= min_length)
 
                 line_dict = make_line(p, ul, ll, clip)
                 if line_dict:
-                    edges.append(line_to_edge(line_dict))
+                    append_native(line_dict, i, line_like)
 
                 line_dict = make_line(p, ll, lr, clip)
                 if line_dict:
-                    edges.append(line_to_edge(line_dict))
+                    append_native(line_dict, i, line_like)
 
                 line_dict = make_line(p, lr, ur, clip)
                 if line_dict:
-                    edges.append(line_to_edge(line_dict))
+                    append_native(line_dict, i, line_like)
 
                 line_dict = make_line(p, ur, ul, clip)
                 if line_dict:
-                    edges.append(line_to_edge(line_dict))
+                    append_native(line_dict, i, line_like)
 
     path = {"color": (0, 0, 0), "fill": None, "width": 1}
+    extra_edges = []
+    if add_lines is not None:  # add user-specified lines
+        assert isinstance(add_lines, (tuple, list))
+    else:
+        add_lines = []
+    for p1, p2 in add_lines:
+        p1 = pymupdf.Point(p1)
+        p2 = pymupdf.Point(p2)
+        line_dict = make_line(path, p1, p2, clip)
+        if line_dict:
+            extra_edges.append(line_to_edge(line_dict))
+
+    extra_line_count = len(extra_edges)
+    if add_boxes is not None:  # add user-specified rectangles
+        assert isinstance(add_boxes, (tuple, list))
+    else:
+        add_boxes = []
+    for box in add_boxes:
+        r = pymupdf.Rect(box)
+        line_dict = make_line(path, r.tl, r.bl, clip)
+        if line_dict:
+            extra_edges.append(line_to_edge(line_dict))
+        line_dict = make_line(path, r.bl, r.br, clip)
+        if line_dict:
+            extra_edges.append(line_to_edge(line_dict))
+        line_dict = make_line(path, r.br, r.tr, clip)
+        if line_dict:
+            extra_edges.append(line_to_edge(line_dict))
+        line_dict = make_line(path, r.tr, r.tl, clip)
+        if line_dict:
+            extra_edges.append(line_to_edge(line_dict))
+
+    if ruling_filter is not None:
+        edges, bboxes = ruling_filter(
+            page, paths, edges, origins, bboxes, extra_edges, extra_line_count, tset)
+
     for bbox in bboxes:  # add the border lines for all enveloping bboxes
         line_dict = make_line(path, bbox.tl, bbox.tr, clip)
         if line_dict:
@@ -2666,35 +2717,8 @@ def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes
         if line_dict:
             edges.append(line_to_edge(line_dict))
 
-    if add_lines is not None:  # add user-specified lines
-        assert isinstance(add_lines, (tuple, list))
-    else:
-        add_lines = []
-    for p1, p2 in add_lines:
-        p1 = pymupdf.Point(p1)
-        p2 = pymupdf.Point(p2)
-        line_dict = make_line(path, p1, p2, clip)
-        if line_dict:
-            edges.append(line_to_edge(line_dict))
-
-    if add_boxes is not None:  # add user-specified rectangles
-        assert isinstance(add_boxes, (tuple, list))
-    else:
-        add_boxes = []
-    for box in add_boxes:
-        r = pymupdf.Rect(box)
-        line_dict = make_line(path, r.tl, r.bl, clip)
-        if line_dict:
-            edges.append(line_to_edge(line_dict))
-        line_dict = make_line(path, r.bl, r.br, clip)
-        if line_dict:
-            edges.append(line_to_edge(line_dict))
-        line_dict = make_line(path, r.br, r.tr, clip)
-        if line_dict:
-            edges.append(line_to_edge(line_dict))
-        line_dict = make_line(path, r.tr, r.tl, clip)
-        if line_dict:
-            edges.append(line_to_edge(line_dict))
+    edges.extend(extra_edges)
+    EDGES._list().extend(edges)
 
 
 def page_rotation_set0(page):
@@ -3061,6 +3085,7 @@ def find_tables(
                 paths=paths,
                 add_lines=add_lines,
                 add_boxes=add_boxes,
+                ruling_filter=_ruling_filter,
             )  # create lines and curves
 
             tbf = TableFinder(page, settings=tset, cell_group_filter=_cell_group_filter)
