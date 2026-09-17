@@ -1829,6 +1829,9 @@ class Table:
         td-only table is built from :meth:`extract`.
         """
         if self.placements is not None:
+            for row in self.placements:
+                for cell in row:
+                    cell.validate_source_content()
             return render_table_html(self.placements, self.section_rows)
         # No placements: flat td-only grid from extract().
         rows = [
@@ -2213,6 +2216,10 @@ class TableFinder:
         self.page = weakref.proxy(page)
         self.textpage = None
         self.settings = TableSettings.resolve(settings)
+        # Preserve source segments before snapping/joining can mix a genuine
+        # rule with a synthetic envelope. These are the existing converted edges.
+        self.ruling_evidence = tuple(dict(e) for e in EDGES
+                                    if e.get("ruling_origin") in ("vector", "raster"))
         self.edges = self.get_edges()
         self.intersections = edges_to_intersections(
             self.edges,
@@ -2362,6 +2369,7 @@ def make_chars(page, clip=None):
     ctm = page.transformation_matrix
     TEXTPAGE = page.get_textpage(clip=clip, flags=FLAGS)
     blocks = page.get_text("rawdict", textpage=TEXTPAGE)["blocks"]
+    page._table_raw_blocks = blocks
     doctop_base = page_height * page.number
     for block in blocks:
         for line in block["lines"]:
@@ -2412,6 +2420,8 @@ def make_chars(page, clip=None):
                         "y1": bbox_ctm.y1,
                     }
                     chars.append(char_dict)
+    from ._table_font_symbols import control_glyphs
+    page._table_control_glyphs = control_glyphs(page, chars)
     return TEXTPAGE
 
 
@@ -2622,7 +2632,7 @@ def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes
         return line_dict
 
     def append_native(line, item, line_like):
-        edges.append(line_to_edge(line))
+        edges.append(dict(line_to_edge(line), ruling_origin="vector"))
         if ruling_filter is not None:
             origins.append((item, line_like))
 
@@ -2719,12 +2729,15 @@ def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes
         assert isinstance(add_lines, (tuple, list))
     else:
         add_lines = []
+    raster_cache = getattr(page, "_pymupdf4llm_raster_table_lines", {})
+    raster_lines = {tuple(tuple(pt) for pt in line) for line in raster_cache.get("lines", ())} if isinstance(raster_cache, dict) else set()
     for p1, p2 in add_lines:
+        origin = "raster" if (tuple(p1), tuple(p2)) in raster_lines else "user_line"
         p1 = pymupdf.Point(p1)
         p2 = pymupdf.Point(p2)
         line_dict = make_line(path, p1, p2, clip)
         if line_dict:
-            extra_edges.append(line_to_edge(line_dict))
+            extra_edges.append(dict(line_to_edge(line_dict), ruling_origin=origin))
 
     extra_line_count = len(extra_edges)
     if add_boxes is not None:  # add user-specified rectangles
@@ -2860,6 +2873,8 @@ def _refine_flat_placement_grid(page, cells, col_count):
     ("" for a gap), using the same word source and line builder as resolve_spans.
     Used when span resolution changes the column count."""
     page_words = _refine_page_words(page)
+    from pymupdf._table_spans import _span_grid_supplements, _span_positioned_word_lines
+    supplements = _span_grid_supplements(page, page_words, [c for row in cells for c in row if c is not None])
     grid = []
     for row in cells:
         out = []
@@ -2868,14 +2883,17 @@ def _refine_flat_placement_grid(page, cells, col_count):
                 out.append(SpanCell(bbox=None, text="", colspan=1, rowspan=1))
             else:
                 rect = pymupdf.Rect(cell)
-                line_words = [
-                    _span_word_line_tuple(word)
-                    for _, word in _span_select_words_in_rect(page_words, rect)
-                ]
+                from pymupdf._table_spans import _span_word_sources
+                selected = _span_select_words_in_rect(page_words, rect)
+                extra = supplements.get(tuple(rect), {})
+                selected.extend((i,page_words[i]) for i in extra)
+                selected.sort(key=lambda item:item[0])
+                line_words = _span_positioned_word_lines(selected, extra)
                 out.append(
                     SpanCell(
                         bbox=tuple(rect),
                         text=_span_words_to_line_text(line_words),
+                        sources=_span_word_sources(page_words, selected, extra),
                         colspan=1,
                         rowspan=1,
                     )
@@ -3238,4 +3256,5 @@ def find_tables(
     for table in tbf.tables:
         table.textpage = TEXTPAGE
         table._chars = chars
+        table._ruling_edges = tbf.ruling_evidence
     return tbf
