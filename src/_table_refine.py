@@ -202,9 +202,11 @@ def _refine_table_rect(cells, table_bbox):
 
 
 def _refine_raw_shaded_rects(page, table_rect, *, min_dim):
+    from pymupdf.table import _get_table_drawings
+
     out = []
     page_width = float(page.rect.width)
-    for drawing in page.get_drawings():
+    for drawing in _get_table_drawings(page):
         if _refine_is_white(drawing.get("fill")):
             continue
         for item in drawing.get("items", []):
@@ -253,9 +255,11 @@ def _refine_cluster(values, *, tolerance):
 
 
 def _refine_border_lines(page, table_rect):
+    from pymupdf.table import _get_table_drawings
+
     xs = set()
     ys = set()
-    for drawing in page.get_drawings():
+    for drawing in _get_table_drawings(page):
         stroked = drawing.get("type") in ("s", "fs")
         for item in drawing.get("items", []):
             kind = item[0]

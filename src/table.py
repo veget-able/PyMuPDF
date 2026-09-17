@@ -123,6 +123,7 @@ from pymupdf._table_refine import refine_grid  # noqa: F401  # pylint: disable=u
 _EDGES_VAR = ContextVar("pymupdf_table_edges", default=None)
 _CHARS_VAR = ContextVar("pymupdf_table_chars", default=None)
 _HTML_TABLES_ONLY = ContextVar("pymupdf_html_tables_only", default=False)
+_TABLE_DRAWINGS = ContextVar("pymupdf_table_drawings", default=None)
 
 
 @contextmanager
@@ -133,10 +134,39 @@ def _html_table_scope():
     calls outside this scope keep eager headers and their original page state.
     """
     token = _HTML_TABLES_ONLY.set(True)
+    drawings_token = _TABLE_DRAWINGS.set({})
     try:
         yield
     finally:
+        _TABLE_DRAWINGS.reset(drawings_token)
         _HTML_TABLES_ONLY.reset(token)
+
+
+def _get_table_drawings(page, *, native=False):
+    """Read-only default get_drawings result within one HTML page extraction.
+
+    Public/direct consumers outside that read scope still extract afresh.
+    OCR precedes the scope; geometry/content-stream changes use separate keys.
+    In-place PDF stream/resource edits are not supported within the read scope.
+    Text extraction flags and cell/grid changes do not affect vector graphics.
+    native=True isolates the rects/items that the existing edge builder edits.
+    Point/Quad values remain shared because that builder only reads them.
+    """
+    cache = _TABLE_DRAWINGS.get()
+    if cache is None:
+        return page.get_drawings()
+    key = (page, page.rotation, tuple(page.rect), tuple(page.cropbox),
+           tuple(page.mediabox), tuple(page.get_contents()))
+    if key not in cache:
+        cache[key] = page.get_drawings()
+    paths = cache[key]
+    if not native:
+        return paths
+    # Collection extends path rects and normalizes rectangle items; make_edges
+    # appends closing lines. Other consumers must see the original drawings.
+    return [dict(p, rect=pymupdf.Rect(p["rect"]), items=[
+        (i[0], pymupdf.Rect(i[1]), *i[2:]) if i[0] == "re" else i
+        for i in p["items"]]) for p in paths]
 
 
 class _TableStateList:
@@ -2432,7 +2462,7 @@ def _collect_graphic_evidence(page, npaths, *, snap_x, snap_y, min_length,
                               lines_strict, chars):
     """Detect and join rectangles of "connected" vector graphics."""
     if npaths is None:
-        allpaths = page.get_drawings()
+        allpaths = _get_table_drawings(page, native=True)
     else:  # accept passed-in vector graphics
         allpaths = npaths[:]  # paths relevant for table detection
     paths = []
