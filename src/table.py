@@ -77,6 +77,7 @@ import itertools
 import string
 import html
 from collections.abc import Sequence
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from operator import itemgetter
@@ -121,6 +122,21 @@ from pymupdf._table_refine import refine_grid  # noqa: F401  # pylint: disable=u
 
 _EDGES_VAR = ContextVar("pymupdf_table_edges", default=None)
 _CHARS_VAR = ContextVar("pymupdf_table_chars", default=None)
+_HTML_TABLES_ONLY = ContextVar("pymupdf_html_tables_only", default=False)
+
+
+@contextmanager
+def _html_table_scope():
+    """Omit legacy column headers for HTML-only, non-escaping Table objects.
+
+    Includes nested union/refine/split/join constructors. Public Table/finder
+    calls outside this scope keep eager headers and their original page state.
+    """
+    token = _HTML_TABLES_ONLY.set(True)
+    try:
+        yield
+    finally:
+        _HTML_TABLES_ONLY.reset(token)
 
 
 class _TableStateList:
@@ -1630,7 +1646,8 @@ class Table:
         # cells. Set only for a union grid-ref table, whose reported region
         # (its layout box) is decoupled from its replacement cell grid.
         self._bbox = bbox
-        self.header = self._get_header()  # PyMuPDF extension
+        # HTML uses placements/header_rows; it never reads this legacy result.
+        self.header = None if _HTML_TABLES_ONLY.get() else self._get_header()
         # Filled by find_tables(refine=True): placements is a row-major grid of
         # tagged SpanCell colspan/rowspan placements (None otherwise); header_rows
         # is the leading header-row count, section_rows the section-label rows.
