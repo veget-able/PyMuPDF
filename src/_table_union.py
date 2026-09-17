@@ -456,7 +456,6 @@ def _union_text_span_rects(page):
     return spans
 
 
-
 def _union_cell_span_group_count(cell, text_spans):
     """Max horizontally-separated text-span groups on any single text line in a cell."""
     line_bands = []
