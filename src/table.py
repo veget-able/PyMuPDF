@@ -2364,6 +2364,119 @@ def make_chars(page, clip=None):
 # We are ignoring Bézier curves completely and are converting everything
 # else to lines.
 # ------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Ruling-evidence collection boundary (행동 불변 분리, 2026-09-12).
+# make_edges 내부 클로저였던 합성 외곽선 생성(clean_graphics)과 이웃 판정을
+# 모듈 수준으로 순수 이동한 것이다. 상수·호출 순서·동작은 동일하다.
+# 증거 소스 4종과 소비 순서(벡터 l/re/qu -> 합성 외곽선 테두리 -> 사용자/
+# raster 가상선 -> 사용자 박스)는 make_edges에 그대로 남는다. 이 경계는
+# 후속 detect-admission 실험(source-stage evidence 조건)의 부착 지점이다.
+# ---------------------------------------------------------------------------
+def _evidence_are_neighbors(r1, r2, snap_x, snap_y):
+    """Detect whether r1, r2 are neighbors.
+
+    Defined as:
+    The minimum distance between points of r1 and points of r2 is not
+    larger than some delta.
+
+    This check supports empty rect-likes and thus also lines.
+
+    Note:
+    This type of check is MUCH faster than native Rect containment checks.
+    """
+    if (  # check if x-coordinates of r1 are within those of r2
+        r2.x0 - snap_x <= r1.x0 <= r2.x1 + snap_x
+        or r2.x0 - snap_x <= r1.x1 <= r2.x1 + snap_x
+    ) and (  # ... same for y-coordinates
+        r2.y0 - snap_y <= r1.y0 <= r2.y1 + snap_y
+        or r2.y0 - snap_y <= r1.y1 <= r2.y1 + snap_y
+    ):
+        return True
+
+    # same check with r1 / r2 exchanging their roles (this is necessary!)
+    if (
+        r1.x0 - snap_x <= r2.x0 <= r1.x1 + snap_x
+        or r1.x0 - snap_x <= r2.x1 <= r1.x1 + snap_x
+    ) and (
+        r1.y0 - snap_y <= r2.y0 <= r1.y1 + snap_y
+        or r1.y0 - snap_y <= r2.y1 <= r1.y1 + snap_y
+    ):
+        return True
+    return False
+
+
+def _collect_graphic_evidence(page, npaths, *, snap_x, snap_y, min_length,
+                              lines_strict, chars):
+    """Detect and join rectangles of "connected" vector graphics."""
+    if npaths is None:
+        allpaths = page.get_drawings()
+    else:  # accept passed-in vector graphics
+        allpaths = npaths[:]  # paths relevant for table detection
+    paths = []
+    bbox_paths = []
+    for p in allpaths:
+        # If only looking at lines, ignore large fill-only paths, but
+        # retain line-like rectangle items inside them. Some producers
+        # batch hundreds of thin grid-rule rectangles into one fill path;
+        # its aggregate path bbox is large even though every relevant
+        # item is a simulated horizontal or vertical line.
+        if (
+            lines_strict
+            and p["type"] == "f"
+            and p["rect"].width > snap_x
+            and p["rect"].height > snap_y
+        ):
+            line_items = []
+            for item in p["items"]:
+                if item[0] != "re":
+                    continue
+                rect = item[1].normalize()
+                if (
+                    rect.width <= min_length
+                    and rect.width < rect.height
+                ) or (
+                    rect.height <= min_length
+                    and rect.height < rect.width
+                ):
+                    line_items.append(item)
+            if line_items:
+                line_path = p.copy()
+                line_path["items"] = line_items
+                paths.append(line_path)
+            continue
+        paths.append(p)
+        bbox_paths.append(p)
+
+    # start with all vector graphics rectangles
+    prects = sorted(set([p["rect"] for p in bbox_paths]), key=lambda r: (r.y1, r.x0))
+    new_rects = []  # the final list of joined rectangles
+    # ----------------------------------------------------------------
+    # Strategy: Join rectangles that "almost touch" each other.
+    # Extend first rectangle with any other that is a "neighbor".
+    # Then move it to the final list and continue with the rest.
+    # ----------------------------------------------------------------
+    while prects:  # the algorithm will empty this list
+        prect0 = prects[0]  # copy of first rectangle (performance reasons!)
+        repeat = True
+        while repeat:  # this loop extends first rect in list
+            repeat = False  # set to true again if some other rect touches
+            for i in range(len(prects) - 1, 0, -1):  # run backwards
+                if _evidence_are_neighbors(prect0, prects[i], snap_x, snap_y):  # close enough to rect 0?
+                    prect0 |= prects[i].tl  # extend rect 0
+                    prect0 |= prects[i].br  # extend rect 0
+                    del prects[i]  # delete this rect
+                    repeat = True  # keep checking the rest
+
+        # move rect 0 over to result list if there is some text in it
+        if chars_in_rect(chars, prect0):
+            # contains text, so accept it as a table bbox candidate
+            new_rects.append(prect0)
+        del prects[0]  # remove from rect list
+
+    return new_rects, paths
+
+
+
 def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes=None):
     edges = EDGES._list()  # bind once: avoid per-append proxy overhead below
     snap_x = tset.snap_x_tolerance
@@ -2385,108 +2498,9 @@ def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes
     else:
         clip = prect
 
-    def are_neighbors(r1, r2):
-        """Detect whether r1, r2 are neighbors.
-
-        Defined as:
-        The minimum distance between points of r1 and points of r2 is not
-        larger than some delta.
-
-        This check supports empty rect-likes and thus also lines.
-
-        Note:
-        This type of check is MUCH faster than native Rect containment checks.
-        """
-        if (  # check if x-coordinates of r1 are within those of r2
-            r2.x0 - snap_x <= r1.x0 <= r2.x1 + snap_x
-            or r2.x0 - snap_x <= r1.x1 <= r2.x1 + snap_x
-        ) and (  # ... same for y-coordinates
-            r2.y0 - snap_y <= r1.y0 <= r2.y1 + snap_y
-            or r2.y0 - snap_y <= r1.y1 <= r2.y1 + snap_y
-        ):
-            return True
-
-        # same check with r1 / r2 exchanging their roles (this is necessary!)
-        if (
-            r1.x0 - snap_x <= r2.x0 <= r1.x1 + snap_x
-            or r1.x0 - snap_x <= r2.x1 <= r1.x1 + snap_x
-        ) and (
-            r1.y0 - snap_y <= r2.y0 <= r1.y1 + snap_y
-            or r1.y0 - snap_y <= r2.y1 <= r1.y1 + snap_y
-        ):
-            return True
-        return False
-
-    def clean_graphics(npaths=None):
-        """Detect and join rectangles of "connected" vector graphics."""
-        if npaths is None:
-            allpaths = page.get_drawings()
-        else:  # accept passed-in vector graphics
-            allpaths = npaths[:]  # paths relevant for table detection
-        paths = []
-        bbox_paths = []
-        for p in allpaths:
-            # If only looking at lines, ignore large fill-only paths, but
-            # retain line-like rectangle items inside them. Some producers
-            # batch hundreds of thin grid-rule rectangles into one fill path;
-            # its aggregate path bbox is large even though every relevant
-            # item is a simulated horizontal or vertical line.
-            if (
-                lines_strict
-                and p["type"] == "f"
-                and p["rect"].width > snap_x
-                and p["rect"].height > snap_y
-            ):
-                line_items = []
-                for item in p["items"]:
-                    if item[0] != "re":
-                        continue
-                    rect = item[1].normalize()
-                    if (
-                        rect.width <= min_length
-                        and rect.width < rect.height
-                    ) or (
-                        rect.height <= min_length
-                        and rect.height < rect.width
-                    ):
-                        line_items.append(item)
-                if line_items:
-                    line_path = p.copy()
-                    line_path["items"] = line_items
-                    paths.append(line_path)
-                continue
-            paths.append(p)
-            bbox_paths.append(p)
-
-        # start with all vector graphics rectangles
-        prects = sorted(set([p["rect"] for p in bbox_paths]), key=lambda r: (r.y1, r.x0))
-        new_rects = []  # the final list of joined rectangles
-        # ----------------------------------------------------------------
-        # Strategy: Join rectangles that "almost touch" each other.
-        # Extend first rectangle with any other that is a "neighbor".
-        # Then move it to the final list and continue with the rest.
-        # ----------------------------------------------------------------
-        while prects:  # the algorithm will empty this list
-            prect0 = prects[0]  # copy of first rectangle (performance reasons!)
-            repeat = True
-            while repeat:  # this loop extends first rect in list
-                repeat = False  # set to true again if some other rect touches
-                for i in range(len(prects) - 1, 0, -1):  # run backwards
-                    if are_neighbors(prect0, prects[i]):  # close enough to rect 0?
-                        prect0 |= prects[i].tl  # extend rect 0
-                        prect0 |= prects[i].br  # extend rect 0
-                        del prects[i]  # delete this rect
-                        repeat = True  # keep checking the rest
-
-            # move rect 0 over to result list if there is some text in it
-            if chars_in_rect(CHARS, prect0):
-                # contains text, so accept it as a table bbox candidate
-                new_rects.append(prect0)
-            del prects[0]  # remove from rect list
-
-        return new_rects, paths
-
-    bboxes, paths = clean_graphics(npaths=paths)
+    bboxes, paths = _collect_graphic_evidence(
+        page, paths, snap_x=snap_x, snap_y=snap_y, min_length=min_length,
+        lines_strict=lines_strict, chars=CHARS)
 
     def is_parallel(p1, p2):
         """Check if line is roughly axis-parallel."""
