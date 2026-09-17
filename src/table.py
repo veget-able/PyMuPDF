@@ -2986,6 +2986,35 @@ def _refine_build_placements(page, working, body_start):
     return tagged, region
 
 
+def _refine_grid_tables(page, grid, table_bbox, make_table, *, split_repeated_headers):
+    """Refine a fresh grid and yield tagged tables in the approved order.
+
+    ``make_table(flat, was_split)`` owns each consumer's bbox, empty-cell and
+    provenance policy. Yield after role assignment so the caller can attach
+    its text snapshot before the next segment is processed. The caller also
+    owns page geometry and exception recovery. Resolve helpers at call time
+    to preserve the R6/deferred-role hook on _refine_build_placements.
+    """
+    working = refine_grid_structure(page, grid, table_bbox=table_bbox)
+    body_start = _refine_body_start_row(page, working)
+    working = refine_grid_rows(page, working, header_row_count=body_start)
+    segments = (
+        _refine_split_repeated_leading_headers(page, working)
+        if split_repeated_headers
+        else [working]
+    )
+    was_split = len(segments) > 1
+    for segment in segments:
+        flat = _refine_grid_to_cells(segment)
+        tab = make_table(flat, was_split)
+        start = _refine_body_start_row(page, segment) if was_split else body_start
+        placements, region = _refine_build_placements(page, segment, start)
+        tab.placements = placements
+        tab.header_rows = region.top_header_rows
+        tab.section_rows = region.section_header_rows
+        yield tab
+
+
 def find_tables(
     page,
     clip=None,
@@ -3170,27 +3199,10 @@ def find_tables(
             refined_tables = []
             for tab in tbf.tables:
                 grid = _refine_cells_to_grid(tab.cells)
-                # The reported bbox (a union grid-ref table's layout box, else
-                # the cells' union) bounds the shaded-rectangle search.
-                working = refine_grid_structure(page, grid, table_bbox=tab.bbox)
-                body_start = _refine_body_start_row(page, working)
-                working = refine_grid_rows(page, working, header_row_count=body_start)
-                segments = (
-                    _refine_split_repeated_leading_headers(page, working)
-                    if union
-                    else [working]
-                )
-                was_split = len(segments) > 1
-                for segment in segments:
-                    flat = _refine_grid_to_cells(segment)
-                    # An unsplit union grid-ref retains its explicit reported
-                    # layout bbox. Split tables use their segment-cell unions.
+                def make_refined_table(flat, was_split):
+                    # Preserve native empty-grid fallback and explicit bbox.
                     new_tab = (
-                        Table(
-                            page,
-                            flat,
-                            bbox=None if was_split else tab._bbox,
-                        )
+                        Table(page, flat, bbox=None if was_split else tab._bbox)
                         if flat
                         else tab
                     )
@@ -3203,20 +3215,12 @@ def find_tables(
                             parent_bbox=list(tab.bbox),
                         )
                     new_tab.bbox_provenance = provenance
-                    segment_body_start = (
-                        _refine_body_start_row(page, segment)
-                        if was_split
-                        else body_start
-                    )
-                    # Build the tagged model on `segment` directly, not on the
-                    # re-gridded new_tab.cells, so placements match its grid.
-                    placements, region = _refine_build_placements(
-                        page, segment, segment_body_start
-                    )
-                    new_tab.placements = placements
-                    new_tab.header_rows = region.top_header_rows
-                    new_tab.section_rows = region.section_header_rows
-                    refined_tables.append(new_tab)
+                    return new_tab
+
+                refined_tables.extend(_refine_grid_tables(
+                    page, grid, tab.bbox, make_refined_table,
+                    split_repeated_headers=union,
+                ))
             tbf.tables = refined_tables
     except Exception as e:
         pymupdf.message("find_tables: exception occurred: %s" % str(e))
