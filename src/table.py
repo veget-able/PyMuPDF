@@ -3001,7 +3001,9 @@ def _refine_build_placements(page, working, body_start):
     )
     region = find_header_region(_refine_placements_text_grid(grid))
     tagged = _refine_tag_grid(grid, region.top_header_rows)
-    return tagged, region
+    from ._table_pipeline import current
+    runtime = current()
+    return runtime.build_roles(page, tagged, region) if runtime is not None else (tagged, region)
 
 
 def _refine_grid_tables(page, grid, table_bbox, make_table, *, split_repeated_headers):
@@ -3014,6 +3016,10 @@ def _refine_grid_tables(page, grid, table_bbox, make_table, *, split_repeated_he
     to preserve the R6/deferred-role hook on _refine_build_placements.
     """
     working = refine_grid_structure(page, grid, table_bbox=table_bbox)
+    from ._table_pipeline import current
+    runtime = current()
+    if runtime is not None:
+        working = runtime.refine_header_band(page, working)
     body_start = _refine_body_start_row(page, working)
     working = refine_grid_rows(page, working, header_row_count=body_start)
     segments = (

@@ -1,5 +1,9 @@
 # PyMuPDF Table 기능 명세
 
+2026-09-23 제품 내부 이식: 아래 동결 명세의 PB 외부 활성화 설명은
+[제품 내부 경계 문서](native-table-pipeline.md)와 짝 제품의 실행 경로로 대체한다.
+PyMuPDF 자체는 ONNX나 PyMuPDF4LLM에 의존하지 않는다.
+
 이 파일은 pb_table의 기능 명세에서 이 저장소의 변경과 필요한 공통 계약을 발췌한 동결본이다.
 원문: PB:docs/benchmarks/table-feature-specification.md (2026-09-17). 절 번호는 원문과 같다.
 PM=PyMuPDF, LL=PyMuPDF4LLM Table, OCR=별도 OCR 브랜치, PB=pb_table 실행 어댑터다.

@@ -77,7 +77,7 @@ def _entry_with_provenance(entry, **updates):
     return _TableGridEntry(entry[0], entry[1], provenance)
 
 
-def _layout_table_grids(page):
+def _layout_table_grids_base(page):
     """Primary table grids from the raw layout analyzer result.
 
     Reads page.layout_information in its raw (return_raw=True) form and yields a
@@ -566,7 +566,7 @@ class _UnionSelection:
             self.split_groups[key] = children if previous is None else previous + children
 
 
-def _union_replace_append(existing, candidates, *, page, grid_ref, grid_ref_iou, span_mult_gate, span_mult_threshold, _selection=None):
+def _union_replace_append_base(existing, candidates, *, page, grid_ref, grid_ref_iou, span_mult_gate, span_mult_threshold, _selection=None):
     """Fuse primary and candidate ``(bbox, grid)`` entries.
 
     Applies grid-ref replacement, split replacement (>=2 candidates owned by one
@@ -671,3 +671,15 @@ def _find_tables_union(page, *, add_lines=None, add_boxes=None):
         tables.append(table)
     finder.tables = tables
     return finder
+
+
+def _layout_table_grids(page):
+    from ._table_pipeline import current
+    runtime = current()
+    return runtime.pipeline.adapter.primaries(page) if runtime is not None else _layout_table_grids_base(page)
+
+
+def _union_replace_append(existing, candidates, **kwargs):
+    from ._table_pipeline import current
+    runtime = current()
+    return runtime.fuse(existing, candidates, **kwargs) if runtime is not None else _union_replace_append_base(existing, candidates, **kwargs)
