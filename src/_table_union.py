@@ -35,6 +35,7 @@ from pymupdf.table import CHARS, EDGES, Table, TableFinder, _iou, _cells_to_rows
 
 # Optional evidence policy, not an additional P1. The isolated runner scopes it.
 _UNION_RULING_FILTER = None
+_UNION_PICTURE_CONTAINMENT = 0.8
 
 
 # ---------------------------------------------------------------------------
@@ -144,8 +145,11 @@ def _union_line_candidates(page, *, add_lines=None, add_boxes=None):
             if key in seen:
                 continue
             seen.add(key)
-            if not (_union_grid_has_2d_content_support(grid)
-                    or not _union_candidate_conflicts_with_layout(live_page, bbox, grid)):
+            if _union_candidate_inside_picture(live_page, bbox):
+                if not _union_grid_has_aligned_text(grid):
+                    continue
+            elif not (_union_grid_has_2d_content_support(grid)
+                      or not _union_candidate_conflicts_with_layout(live_page, bbox, grid)):
                 continue
             kept.append(cells)
             candidates.append(_TableGridEntry(bbox, grid, {
@@ -212,6 +216,129 @@ def _union_find_owner(candidate_bbox, existing_bboxes):
         elif candidate_containment >= _UNION_OWNER_AMBIGUOUS_OVERLAP or existing_coverage >= _UNION_OWNER_AMBIGUOUS_OVERLAP:
             ambiguous = True
     return best_owner, ambiguous
+
+
+def _union_grid_has_aligned_text(grid):
+    """Independent picture-contained grids need content, not occupied slots.
+
+    Complete concrete cells support compact/spanning/numeric-only tables.
+    A complete tiled grid also retains sparse numeric matrices.
+    Sparse/spanning grids need repeated text rows across distinct cells;
+    numeric text is evidence too. None slots do not imply empty area.
+    Characters retain Table.extract's half-open membership. A text band needs
+    a common vertical overlap of at least half its shortest glyph height,
+    independent of absolute font size. Tightening the common intersection
+    prevents a tall glyph from transitively joining separate text rows.
+    """
+
+    cells = [tuple(cell) for row in grid for cell in row
+             if cell is not None and cell[0] < cell[2] and cell[1] < cell[3]]
+    if len(cells) < 2:
+        return False
+    populated = set()
+    assigned = []
+    for char in CHARS:
+        text = str(char.get("text") or "")
+        if not text.strip():
+            continue
+        try:
+            x = (float(char["x0"]) + float(char["x1"])) / 2
+            y = (float(char["top"]) + float(char["bottom"])) / 2
+            top = float(char["top"])
+            bottom = float(char["bottom"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not top < bottom:
+            continue
+        owners = [i for i, c in enumerate(cells)
+                  if c[0] <= x < c[2] and c[1] <= y < c[3]]
+        populated.update(owners)
+        if len(owners) == 1:
+            assigned.append((top, bottom, owners[0]))
+    if len(populated) == len(cells):
+        return True
+    # A genuinely tiled rectangular grid also supports sparse numeric matrices:
+    # empty text is not a missing cell. Exact endpoints reuse the snapped grid.
+    width = len(grid[0]) if grid else 0
+    if (len(grid) >= 2 and width >= 2 and len(populated) >= 2
+            and all(len(row) == width and all(cell is not None for cell in row)
+                    for row in grid)):
+        x_intervals = [(cell[0], cell[2]) for cell in grid[0]]
+        y_intervals = [(row[0][1], row[0][3]) for row in grid]
+        if (all(a[1] == b[0] for a, b in zip(x_intervals, x_intervals[1:]))
+                and all(a[1] == b[0] for a, b in zip(y_intervals, y_intervals[1:]))
+                and all((cell[0], cell[2]) == x_intervals[c]
+                        and (cell[1], cell[3]) == y_intervals[r]
+                        for r, row in enumerate(grid) for c, cell in enumerate(row))):
+            return True
+    # Keep a common overlap, not the union of intersecting glyph boxes. A
+    # chain of partial overlaps otherwise turns adjacent lines into one row.
+    bands = []
+    for top, bottom, owner in sorted(assigned, key=lambda c: (c[1], c[0], c[2])):
+        height = bottom - top
+        if bands:
+            band = bands[-1]
+            overlap = min(band[1], bottom) - max(band[0], top)
+            if overlap >= 0.5 * min(band[2], height):
+                band[0] = max(band[0], top)
+                band[1] = min(band[1], bottom)
+                band[2] = min(band[2], height)
+                band[3].add(owner)
+                continue
+        bands.append([top, bottom, height, {owner}])
+    aligned_rows = 0
+    for _, _, _, row_owners in bands:
+        owners = sorted(row_owners)
+        if any(cells[a][0] >= cells[b][2] or cells[b][0] >= cells[a][2]
+               for j, a in enumerate(owners) for b in owners[:j]):
+            aligned_rows += 1
+    return aligned_rows >= 2
+
+
+def _union_layout_groups(page):
+    """The page's layout groups as ``(class_name, rect)``, skipping unusable ones."""
+    groups = []
+    for group in (page.layout_information or []):
+        if not isinstance(group, dict):
+            continue
+        group_bbox = group.get("group_bbox")
+        if not group_bbox:
+            continue
+        try:
+            rect = pymupdf.Rect(group_bbox[:4])
+        except (TypeError, ValueError):
+            continue
+        if rect.is_empty:
+            continue
+        groups.append((group.get("class_name"), rect))
+    return groups
+
+
+def _union_candidate_inside_picture(page, candidate_bbox):
+    """Whether a candidate sits inside a layout picture group without covering it.
+
+    Picture classification is not proof that the region is a chart. It selects
+    the content/topology admission check in _union_line_candidates: concrete
+    cell occupancy, a complete tiled grid, or repeated visual text alignment.
+    That check also accepts numeric-only text and uses glyph-height overlap;
+    it does not require a labelled header or a half-full label column.
+
+    A candidate larger than the picture contains it instead -- a bordered table
+    with an image in one of its cells -- and keeps the ordinary rule.
+    """
+    candidate_area = _union_rect_area(candidate_bbox)
+    if candidate_area <= 0:
+        return False
+    threshold = _UNION_PICTURE_CONTAINMENT * candidate_area
+    for class_name, rect in _union_layout_groups(page):
+        if class_name != "picture":
+            continue
+        if _union_intersection_area(candidate_bbox, rect) < threshold:
+            continue
+        if candidate_area > _union_rect_area(rect):
+            continue  # the candidate is the larger region: it holds the picture
+        return True
+    return False
 
 
 def _union_text_line_count(intervals):

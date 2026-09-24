@@ -1,5 +1,9 @@
 # PyMuPDF Table 기능 명세
 
+2026-09-24 후속 수정과 최신 검증 범위는
+[통합 리뷰 묶음](table-regression-fixes-20260924.md)을 참조한다.
+아래 3.4의 picture-contained 승인 조건은 그 문서의 3번으로 보완된다.
+
 2026-09-23 제품 내부 이식: 아래 동결 명세의 PB 외부 활성화 설명은
 [제품 내부 경계 문서](native-table-pipeline.md)와 짝 제품의 실행 경로로 대체한다.
 PyMuPDF 자체는 ONNX나 PyMuPDF4LLM에 의존하지 않는다.
@@ -63,6 +67,32 @@ page text / native rules / image pixels
   사라질 수 있다. 일반 선 입력은 유지된다. raster 검출과는 별개로 판단할 수 있다.
 - **구현/확인**: `PM:src/table.py::_collect_graphic_evidence`, `make_edges`;
   얇은 괘선 사례 (원문 PB:docs/benchmarks 기준 상대 경로: ../experiments/v2-thin-filled-rectangle-cases.md).
+
+### 3.2.1 짧은 path의 넓은 stroke 괘선 보존 — `stroke-rule-geometry`
+
+2026-09-24 보완. filled rectangle 처리와 별개인 vector 입력 버그 수정이다.
+
+- **문제/위치**: 짧은 path라도 큰 stroke 폭으로 수직 방향의 긴 사각형을 그릴 수 있다.
+  path 길이만 검사하면 실제 괘선이 최소 길이 필터에서 사라진다. `make_edges`의
+  기존 line 변환 지점에서 clip/길이 필터 전에 실제 도형의 긴 중심선으로 해석한다.
+- **조건**: 단일 축평행 line, 열린 stroke-only path, 불투명도 양수, solid,
+  butt cap, 유한한 stroke 폭이 최소 길이보다 크고 path 길이가 그 이하일 때만 적용한다.
+  round/square cap, dash, compound path, 일반적인 가는 stroke는 기존 처리를 유지한다.
+- **재사용/출력**: 이미 수집된 drawing의 폭·cap·좌표를 쓰며 `make_line`과
+  `append_native`에 edge 하나를 전달한다. 원본 drawing은 수정하지 않는다.
+  PDF 재추출·OCR/GNN/TGIF 호출·새 공용 helper·후단 필터를 추가하지 않는다.
+- **적용/제거**: 공통 변환기 수정이라 standalone `find_tables()`에도 적용된다.
+  별도 공개 스위치는 없다. 이 분기만 제거하면 다른 표 정책은 남지만 해당 stroke가 다시 누락된다.
+- **검증**: 공개 HTML 경로의 DP200/PB503에서 stroke 단독 출력 변화 없음.
+  raster 교차 복구와 결합해도 PB503 raw/정규화 출력·점수 전부 동일
+  (GTRM `0.8098682258124252`). 결합 DP200의 변화는 raster의 DP122 한 문서뿐이다.
+- **기본 API의 별도 결과**: Layout 비활성, OCR 없는 1,669문서/1,671페이지에서
+  default와 `use_layout=False`를 각각 비교했다. 각 모드 1,666문서 동일, 오류 0.
+  BLS Feb 2026 p14/p15/p16은 0표에서 각 3행×8열 부분 격자 1개로 바뀐다.
+  본문 여러 줄이 한 행에 남으므로 완전한 셀 복원으로 주장하지 않는다.
+  이 로컬 코퍼스는 PR에서 언급한 1,463페이지 목록과 다르며 **기본 API 전수 불변은 아니다**.
+- **테스트**: `tests/test_table_stroke_width.py` (9건), 원문 입력 보존·역방향·clip·비대상 보호.
+  재현 자료: PB `runs/laura-ruling-fixes-20260924/README.md`.
 
 ### 3.4 근거 부족 괘선 후보의 승인 거절 — `unsupported-grid-rejection`
 

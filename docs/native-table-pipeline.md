@@ -1,5 +1,16 @@
 # Private structured-table consumer boundary
 
+For the September 24 follow-up (stroke geometry and candidate admission), see
+[the consolidated review bundle](table-regression-fixes-20260924.md). Its PB
+scores remain equal but three PB outputs change, and its DP detection improves.
+The integration-only parity results below are historical, not final-bundle
+output parity claims.
+
+Scope note (2026-09-24): the unchanged-standalone statement below describes the
+September 23 integration only. The subsequent `stroke-rule-geometry` fix changes
+standalone output on three BLS pages. See `docs/table-features.md` section 3.2.1
+for its separate API regression results and limits.
+
 This review change supplies the missing native integration points for the
 paired PyMuPDF4LLM HTML table pipeline. It adds no PyMuPDF4LLM/ONNX dependency to
 PyMuPDF and leaves standalone finder/layout behavior unchanged when no consumer

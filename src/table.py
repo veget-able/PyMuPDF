@@ -2650,7 +2650,31 @@ def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes
 
             if i[0] == "l":  # a line
                 p1, p2 = i[1:]
-                line_dict = make_line(p, p1, p2, clip)
+                line_path = p
+                # A short butt-capped path can paint a long, thin rule across
+                # its direction. Interpret that existing native stroke before
+                # clipping and the first edge-length filter, like thin fill
+                # rectangles above. Other caps/dashes/compound paths retain
+                # their original representation; no second edge is emitted.
+                stroke = p.get("width", 0) or 0
+                caps = p.get("lineCap")
+                if (p.get("type") == "s" and len(items) == 1
+                        and not p.get("closePath")
+                        and p.get("stroke_opacity", 1) > 0
+                        and caps is not None and len(caps) == 3
+                        and all(cap == 0 for cap in caps)
+                        and "".join(p.get("dashes", "").split()) == "[]0"
+                        and min_length < stroke < float("inf")):
+                    dx, dy = abs(p2.x - p1.x), abs(p2.y - p1.y)
+                    if dy == 0 and 0 < dx <= min_length:
+                        cx, cy = (p1.x + p2.x) / 2, p1.y
+                        p1, p2 = pymupdf.Point(cx, cy - stroke / 2), pymupdf.Point(cx, cy + stroke / 2)
+                        line_path = dict(p, width=dx)
+                    elif dx == 0 and 0 < dy <= min_length:
+                        cx, cy = p1.x, (p1.y + p2.y) / 2
+                        p1, p2 = pymupdf.Point(cx - stroke / 2, cy), pymupdf.Point(cx + stroke / 2, cy)
+                        line_path = dict(p, width=dy)
+                line_dict = make_line(line_path, p1, p2, clip)
                 if line_dict:
                     append_native(line_dict, i, line_like)
 
