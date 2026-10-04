@@ -511,6 +511,7 @@ def build():
     ret.append( (f'{g_root}/src/_table_pipeline.py', to_dir) )
     ret.append( (f'{g_root}/src/_table_word_geometry.py', to_dir) )
     ret.append( (f'{g_root}/src/_table_font_symbols.py', to_dir) )
+    ret.append( (f'{g_root}/src/_table_clip.py', to_dir) )
     ret.append( (f'{g_root}/src/_table_headers.py', to_dir) )
     ret.append( (f'{g_root}/src/utils.py', to_dir) )
     ret.append( (f'{g_root}/src/_wxcolors.py', to_dir) )
