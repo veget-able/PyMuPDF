@@ -1,5 +1,9 @@
 # Private structured-table consumer boundary
 
+For the October 13 performance-only update, see
+[union glyph-statistics reuse](glyph-admission-optimization-20261013.md).
+It preserves candidate admission rules and makes NumPy acceleration optional.
+
 For the September 24 follow-up (stroke geometry and candidate admission), see
 [the consolidated review bundle](table-regression-fixes-20260924.md). Its PB
 scores remain equal but three PB outputs change, and its DP detection improves.

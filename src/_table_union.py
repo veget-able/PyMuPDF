@@ -132,6 +132,7 @@ def _union_line_candidates(page, *, add_lines=None, add_boxes=None):
     def admit(live_page, groups):
         # Match the old bbox dedup order BEFORE P1, not after rejection.
         kept, seen = [], set()
+        glyphs = None  # Local to this admission call / immutable CHARS state.
         for cells in groups:
             bbox = pymupdf.Rect(
                 min(c[0] for c in cells), min(c[1] for c in cells),
@@ -148,9 +149,12 @@ def _union_line_candidates(page, *, add_lines=None, add_boxes=None):
             if _union_candidate_inside_picture(live_page, bbox):
                 if not _union_grid_has_aligned_text(grid):
                     continue
-            elif not (_union_grid_has_2d_content_support(grid)
-                      or not _union_candidate_conflicts_with_layout(live_page, bbox, grid)):
-                continue
+            else:
+                if glyphs is None:
+                    glyphs = _UnionGlyphIntervals(CHARS)
+                if not (_union_grid_has_2d_content_support(grid, glyphs=glyphs)
+                        or not _union_candidate_conflicts_with_layout(live_page, bbox, grid)):
+                    continue
             kept.append(cells)
             candidates.append(_TableGridEntry(bbox, grid, {
                 "bbox_source": "find_tables", "grid_source": "find_tables",
@@ -360,7 +364,48 @@ def _union_text_line_count(intervals):
     return count
 
 
-def _union_grid_has_2d_content_support(grid):
+class _UnionGlyphIntervals:
+    """Read-only glyph snapshot for one candidate-admission invocation.
+
+    Coordinates come from the existing finder CHARS in its current coordinate
+    system, not a new text extraction. NumPy is optional for standalone PyMuPDF;
+    both paths preserve float64/Python-float midpoint and half-open membership.
+    No page/global cache: OCR, rotation and nested finder calls may replace CHARS.
+    """
+
+    def __init__(self, chars):
+        values = []
+        for char in chars:
+            if not str(char.get("text") or "").strip():
+                continue
+            try:
+                x = (float(char["x0"]) + float(char["x1"])) / 2.0
+                y = (float(char["top"]) + float(char["bottom"])) / 2.0
+                top = float(char["top"])
+                bottom = float(char["bottom"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            values.append((x, y, top, bottom))
+        try:
+            import numpy as np
+        except ImportError:
+            self.array = None
+            self.values = values
+        else:
+            self.array = np.asarray(values, dtype="float64").reshape(-1, 4)
+            self.values = None
+
+    def intervals(self, rect):
+        x0, y0, x1, y1 = map(float, rect)
+        if self.array is None:
+            return [(top, bottom) for x, y, top, bottom in self.values
+                    if x >= x0 and x < x1 and y >= y0 and y < y1]
+        x, y, top, bottom = self.array.T
+        keep = (x >= x0) & (x < x1) & (y >= y0) & (y < y1)
+        return list(zip(top[keep].tolist(), bottom[keep].tolist()))
+
+
+def _union_grid_has_2d_content_support(grid, *, glyphs=None):
     """Whether a line grid has content distributed like a serializable table.
 
     The primary signal is repeated two-dimensional text. Two bounded topology
@@ -388,24 +433,9 @@ def _union_grid_has_2d_content_support(grid):
                 populated_row.append(False)
                 line_count_row.append(0)
                 continue
-            matched_intervals = []
-            for char in CHARS:
-                if not str(char.get("text") or "").strip():
-                    continue
-                try:
-                    h_mid = (float(char["x0"]) + float(char["x1"])) / 2.0
-                    v_mid = (float(char["top"]) + float(char["bottom"])) / 2.0
-                    top = float(char["top"])
-                    bottom = float(char["bottom"])
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if (
-                    h_mid >= float(rect.x0)
-                    and h_mid < float(rect.x1)
-                    and v_mid >= float(rect.y0)
-                    and v_mid < float(rect.y1)
-                ):
-                    matched_intervals.append((top, bottom))
+            if glyphs is None:
+                glyphs = _UnionGlyphIntervals(CHARS)
+            matched_intervals = glyphs.intervals(rect)
             populated_row.append(bool(matched_intervals))
             line_count_row.append(_union_text_line_count(matched_intervals))
         populated.append(populated_row)
