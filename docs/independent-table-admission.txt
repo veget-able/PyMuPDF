@@ -1,0 +1,48 @@
+독립 괘선 표 승인과 문맥 지연 평가
+2026-10-17 / Laura
+
+기능
+
+- 기존 Layout 표와 별도로 union_append 표를 생성하려면 양성 구조 근거 필요.
+  알려진 veto가 없다는 사실만으로 독립 표 승인 불가.
+- _table_append_structure: 반복 필드·단일 레코드·단일 열·실제 괘선 양식의
+  승인 근거. 일부 헤더 셀 부재 및 회전 축의 본문 반복 구조 지원.
+- _table_append_context / _table_component_context: 수식 괄호·차트 패널·
+  장치 연결망 등의 주변 소속 근거. 기존 GNN 표 공급·분할 권한과 분리.
+- 그림 안 빈 양식 복구: 완전한 셀 구획, 반복 라벨/입력칸 배치,
+  실제 괘선·문자 절단 없음이 입증된 경우 최초 탈락 위치에서 복구.
+  복구 후보의 권한은 독립 추가로 제한, grid_ref/union_split 전환 금지.
+
+계산과 데이터
+
+- 기존 CHARS/EDGES/drawing cache/image occurrence 참조 재사용.
+  추가 PDF 추출·OCR·GNN·TGIF 호출 없음.
+- AppendContext는 생산 시점 문자/edge snapshot과 전체 peer 후보 보존.
+  소유권 결정 후 unowned·non-ambiguous append만 판정.
+- 수식 괄호는 셀 text·벡터 분석 이전 검사. 기존 NumPy CellGlyphs
+  반개구간 소속과 원문 순서 유지, 셀별 결과 공유.
+- drawing key는 page/rotation/rect/cropbox/mediabox/contents 전체 사용.
+  조회 실패 시 빈 근거 반환, 새 drawing 추출 없음.
+- provenance 변환 시 context/index/decision의 명시적 필드 유지.
+- peer 관계 계산은 소유 표도 증거로 유지하므로 첫 append에서 전체
+  후보를 살펴볼 수 있음. cell×char 복잡도 및 전역 시간 상한 미해결.
+
+통합 범위
+
+- 실제 HTML 제품 경로에서 적용, 별도 실험 플래그 없음.
+- 부모 교체 전 노드 소속 확인. 자식 x영역 밖 측면 잔여는 보존 가능한
+  콘텐츠로 취급, 설명할 수 없는 내부 노드 손실이 큰 경우 부모 유지.
+- PyMuPDF4LLM raster 생산자의 이미지 위치 전달과 함께 사용.
+- GNN/헤더 모델·OCR 정책·후단 복원·최종 격자 분할(M1) 추가 없음.
+
+검증과 한계
+
+- 제품 API PB503·DL6489 총6992페이지 성공, 검증된 통합 후보와
+  bbox/HTML/text 및 provenance 동일. 반복 코호트 검증이며 독립시험 아님.
+- 결합 제품 PB GTRM 81.6037738836%, 이전 게시 대비 7상승·4하락·492불변.
+  DocLayNet HTML표 bbox IoU0.60 F1 81.4449181064%, single-GT 추가 시
+  80.6820731434%. 본 모듈 단독의 점수 기여도와 구분.
+- 정상 양식의 picture text/HTML 중복 및 기존 부분표 손실 2건 잔존.
+  제품 전체 비회귀·모든 양식/차트 분리 보장으로 표현 금지.
+- 전체 규칙의 개별 점수 기여도와 지연 평가의 행동 불변 효과 구분.
+- 기존 rule/threshold를 제거·조정하려면 정상표와 실제 비표를 함께 검증.

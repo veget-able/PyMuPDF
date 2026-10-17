@@ -1,5 +1,9 @@
 # PyMuPDF Table 기능 명세
 
+2026-10-17 독립 괘선 표 승인·정상 양식 보호·문맥 지연 평가:
+[기능 및 자료 계약](independent-table-admission.txt) 참조.
+양성 구조 근거를 union_append 생성 권한에 적용하며 기존 표 격자 공급과 구분.
+
 2026-09-24 후속 수정과 최신 검증 범위는
 [통합 리뷰 묶음](table-regression-fixes-20260924.md)을 참조한다.
 아래 3.4의 picture-contained 승인 조건은 그 문서의 3번으로 보완된다.

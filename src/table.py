@@ -145,6 +145,17 @@ def _html_table_scope():
         _HTML_TABLES_ONLY.reset(token)
 
 
+def _table_drawings_key(page):
+    return (page, page.rotation, tuple(page.rect), tuple(page.cropbox),
+            tuple(page.mediabox), tuple(page.get_contents()))
+
+
+def _cached_table_drawings(page):
+    """Producer snapshot for the exact state; never trigger PDF extraction."""
+    cache = _TABLE_DRAWINGS.get()
+    return () if cache is None else cache.get(_table_drawings_key(page), ())
+
+
 def _get_table_drawings(page, *, native=False):
     """Read-only default get_drawings result within one HTML page extraction.
 
@@ -158,8 +169,7 @@ def _get_table_drawings(page, *, native=False):
     cache = _TABLE_DRAWINGS.get()
     if cache is None:
         return page.get_drawings()
-    key = (page, page.rotation, tuple(page.rect), tuple(page.cropbox),
-           tuple(page.mediabox), tuple(page.get_contents()))
+    key = _table_drawings_key(page)
     if key not in cache:
         cache[key] = page.get_drawings()
     paths = cache[key]
