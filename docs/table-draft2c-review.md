@@ -5,7 +5,7 @@ This branch ports the production table functionality onto the exact draft
 
 ## Review pair
 
-- PyMuPDF: `veget-able/PyMuPDF`, `review/table-draft2c-20261021`.
+- PyMuPDF: veget-able/PyMuPDF, 2.0-draft-c-table-20261021.
 - PyMuPDF4LLM: `veget-able/pymupdf4llm`, the same branch name.
 - Bases: PyMuPDF `7db0ab090698d49de637046786c8f85f29d89fd2` and
   PyMuPDF4LLM `d9b212b737dd27550401a2691a5bc1719b2fef2c`.
@@ -60,9 +60,10 @@ patching the original model object. Native geometry flags are restored on exit.
   are not copied into this package.
 - The header contract is self-contained: it imports neither ParseBench nor
   `pb_table`. `rapidfuzz>=3` is a declared runtime dependency.
-- OCR producer changes remain outside this table review pair. The validation
-  run uses the draft's OCR implementation; this distinction is recorded when
-  comparing against the previous production deployment's OCR overrides.
+- Include two OCR/table input-boundary fixes in the paired 4LLM source:
+  distinguish an empty text-culling list from None, and preserve pre-OCR
+  rendering for raster ruling detection. The latter leaves live OCR/GNN input
+  unchanged and invalidates stale raster-line results in both OCR callbacks.
 
 ## Build and validation
 
@@ -88,45 +89,60 @@ pages without tables. Bbox F1 is micro F1 with IoU >= 0.60 and greedy one-to-one
 matching on final HTML table boxes. It is not COCO mAP, a TF/CROSS16 experiment,
 or an average over training seeds. The stricter single-GT result is separate.
 
-+-------------------------+-----------+-----------+-----------+
-| Configuration           | DL F1 %   | PB F1 %   | PB GTRM % |
-+-------------------------+-----------+-----------+-----------+
-| Official draft 2.0_c    | 79.571333 | 81.986143 | 75.861747 |
-| Previous production     | 81.444918 | 88.864143 | 81.603774 |
-| Table port, draft OCR   | 81.499775 | 88.429290 | 80.648183 |
-+-------------------------+-----------+-----------+-----------+
++----------------------+-----------+-----------+-----------+
+| Configuration        | DL F1 %   | PB F1 %   | PB GTRM % |
++----------------------+-----------+-----------+-----------+
+| Official draft 2.0_c | 79.571333 | 81.986143 | 75.861747 |
+| Current production   | 81.444918 | 88.864143 | 81.603774 |
+| Port before A+B      | 81.499775 | 88.429290 | 80.648183 |
+| This branch with A+B | 81.444918 | 88.864143 | 81.603774 |
++----------------------+-----------+-----------+-----------+
 
-For the table port, DL TP/FP/FN is 1815/370/454 (production 1815/373/454),
-and PB is 791/105/102 (production 798/105/95). Single-GT F1 is 80.736417%
-on DL and 87.646730% on PB, versus 80.682073% and 88.084633% in production.
-Single-GT additionally requires exactly one GT owner at >= 50% GT-area coverage;
-ineligible predictions remain false positives.
+The A+B combination restores DL TP/FP/FN 1815/373/454 and PB 798/105/95,
+exactly matching current production. Single-GT F1 is 80.682073% on DL and
+88.084633% on PB, also matching production. Single-GT additionally requires
+exactly one GT owner at >=50% GT-area coverage; ineligible predictions remain FP.
 
-PB GTRM changes are 1 improvement, 9 regressions and 493 unchanged pages.
-This table-only branch is therefore NOT claimed to be a regression-free
-replacement for the deployed package. CON is 0.8788717596137797 and TRM is
-0.7086910229118126. All 6,992 API calls completed, but internal HTML fallback
-occurred on 4 PB pages and 8 DL pages; the latter also occurred in production.
-API completion is not evidence that every table was successfully reconstructed.
+The branch includes these two input-boundary fixes in the paired 4LLM checkout:
+- An empty culling rectangle list preserves all text for OCR; None retains the
+  full-page text-culling default. This restores six Apple proxy-statement pages.
+- Both OCR callbacks preserve the first pre-OCR display list for raster ruling
+  extraction and invalidate stale raster-line cache entries. Live OCR text,
+  layout/GNN inputs and cell-text inputs are not replaced with pre-OCR content.
+  This restores CA2600 and ruling-derived cell structures on BRWS pages.
 
-The missing production OCR changes were isolated in a separate diagnostic:
+The exact combined sources completed full PB503 and DL6489 execution. PB was
+freshly rescored with the official evaluator: GTRM 0.8160377388360863,
+CON 0.8898730100285182, TRM 0.7168015922849151, all pagewise identical to
+production. DL bbox, HTML, full text and raw GNN tables are identical on
+6489/6489 pages; matched GT gains/losses are zero. API failures are zero.
+PB has no HTML fallback; the same eight DL fallback pages remain. API success
+does not mean those eight pages have successful HTML structure reconstruction.
 
-- Distinguishing an empty culling rectangle list from `None` restores the six
-  Apple proxy statement pages and their original GNN table boxes.
-- Preserving the pre-OCR display list for raster ruling extraction restores
-  CA2600. This concerns ruling evidence, not another GNN inference.
-- Applying both in an isolated full PB run reproduced production text/HTML
-  and raw GNN table boxes on 503/503 pages, with TP/FP/FN 798/105/95 and no
-  HTML fallback. This is exact output comparison, not a second official GTRM
-  evaluator run. The equivalent DL OCR-controlled run has not been performed.
+Against the port before A+B, five old FP predictions return and two port-only
+FP predictions disappear (net FP +3). Visual review of the returned predictions
+finds one figure-panel grid, one GUI form and three real tables inside screenshots
+without matching Table annotations. Existing false positives, incomplete table
+extents and annotation-policy differences are not claimed to be resolved.
 
-Neither OCR change is included in this branch. The diagnostic establishes the
-PB input-boundary cause; it does not justify attributing the difference to model
-weights or claiming general safety. All 18 deployed model files, including
-THF1/R6, match the production weights. The native engine differs: draft
-MuPDF 1.28.5 versus the deployed 1.29.0.
+All 18 deployed model files, including THF1/R6, match production. Layout uses
+RF + IMF1; the included IMF2 file is not selected. The native engine remains
+draft MuPDF 1.28.5 versus deployed 1.29.0. There is no model or table-rule change
+in A+B.
 
-Validation in the installed review wheel:
+A+B delivery verification:
+
+- The installed review wheel passes 338 selected tests, including eight new
+  empty-list/None and pre-OCR pixel/cache regression cases.
+- All 157 frozen package files match the full-evaluated A+B composition.
+- Public API output on 21 affected/control pages (14 PB and seven DL) exactly
+  matches that composition in a clean installation without ParseBench or
+  pb_table imports. Both boundary fixes are installed source, not runtime
+  diagnostic overrides. No additional model, rule or threshold change is made.
+- Full PB/DL results above are reused from the identical measured composition;
+  this delivery verification is not presented as another 6992-page rerun.
+
+Original table-only delivery validation (before A+B):
 
 - The final frozen source reruns all 6,992 pages. API/HTML/bbox outputs exactly
   match the first integration run on 6,992/6,992 pages. Bbox scores are recomputed;
@@ -146,3 +162,9 @@ The immutable evaluation artifacts are indexed by
 `20261021-draft2c-port-final` under the production experiment archive. Detailed
 scoring contracts and results are also recorded in the integration workspace's
 `docs/experiments/draft2c-production-port-validation-20261021.txt`.
+
+The A+B full-evaluation archives are 20261021-draft2c-ocr-boundary/both
+(PB503 official rescore) and 20261021-draft2c-ab-dl-full (DL6489).
+The installed delivery wheel, tests and 21-page API comparison are in
+20261021-draft2c-ab-delivery. Integration-workspace report:
+docs/experiments/draft2c-ab-dl-full-validation-20261021.txt.
