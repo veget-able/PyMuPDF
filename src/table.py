@@ -77,6 +77,7 @@ import itertools
 import string
 import html
 from collections.abc import Sequence
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from operator import itemgetter
@@ -94,6 +95,7 @@ from pymupdf._table_refine import (
     _refine_cells_to_grid,
     _refine_grid_to_cells,
     _refine_page_words,
+    _WORD_INDEX_CACHE,
 )
 from pymupdf._table_spans import (
     resolve_spans,
@@ -123,44 +125,74 @@ from pymupdf._table_refine import refine_grid  # noqa: F401  # pylint: disable=u
 
 _EDGES_VAR = ContextVar("pymupdf_table_edges", default=None)
 _CHARS_VAR = ContextVar("pymupdf_table_chars", default=None)
+_TABLE_DRAWINGS = ContextVar("pymupdf_table_drawings", default=None)
+_NO_HEADER_YET = object()
+
+
+@contextmanager
+def _html_table_scope():
+    """Share read-only drawings and word indexes through HTML reconstruction.
+
+    Table.header uses the 2.0 lazy property on every path; the HTML pipeline
+    consumes placements and does not request the legacy header.
+    """
+    drawings_token = _TABLE_DRAWINGS.set({})
+    words_token = _WORD_INDEX_CACHE.set({})
+    try:
+        yield
+    finally:
+        _WORD_INDEX_CACHE.reset(words_token)
+        _TABLE_DRAWINGS.reset(drawings_token)
+
+
+def _table_drawings_key(page):
+    return (page, page.rotation, tuple(page.rect), tuple(page.cropbox),
+            tuple(page.mediabox), tuple(page.get_contents()))
+
+
+def _cached_table_drawings(page):
+    """Producer snapshot for the exact state; never trigger PDF extraction."""
+    cache = _TABLE_DRAWINGS.get()
+    if cache is not None:
+        return cache.get(_table_drawings_key(page), ())
+    cached = getattr(page, "_table_drawings_cache", None)
+    return cached[0] if cached else ()
 
 
 def _get_table_drawings(page, *, native=False):
-    """The page's vector drawings, shared within one find_tables() call.
+    """Read-only default get_drawings result within one HTML page extraction.
 
-    One call reads them up to ``1 + 2T`` times -- once to build edges, and once
-    per refined table for shaded rows and for border lines -- and each read walks
-    the whole content stream. find_tables() therefore puts an empty cache on the
-    page for the duration of the call and removes it again, so nothing outlives
-    the call: a page whose content stream is rewritten between calls cannot be
-    served a stale extraction. Calling the public refine helpers directly, with
-    no find_tables() around them, extracts afresh exactly as before.
-
-    ``native=True`` returns per-path copies of the mutated members: make_edges
-    extends path rects, normalizes rectangle items and appends a closing line, so
-    the other consumers must not see its edits. Point and Quad values stay shared
-    because make_edges only reads them.
+    Public/direct consumers outside that read scope still extract afresh.
+    OCR precedes the scope; geometry/content-stream changes use separate keys.
+    In-place PDF stream/resource edits are not supported within the read scope.
+    Text extraction flags and cell/grid changes do not affect vector graphics.
+    native=True isolates the rects/items that the existing edge builder edits.
+    Point/Quad values remain shared because that builder only reads them.
     """
-    cache = getattr(page, "_table_drawings_cache", None)
+    cache = _TABLE_DRAWINGS.get()
     if cache is None:
-        paths = page.get_drawings()
+        # Preserve 2.0's call-local cache for public/native find_tables calls.
+        local = getattr(page, "_table_drawings_cache", None)
+        if local is None:
+            paths = page.get_drawings()
+        else:
+            if not local:
+                local.append(page.get_drawings())
+            paths = local[0]
     else:
-        if not cache:
-            cache.append(page.get_drawings())
-        paths = cache[0]
+        key = _table_drawings_key(page)
+        if key not in cache:
+            cache[key] = page.get_drawings()
+        paths = cache[key]
     if not native:
         return paths
-    return [
-        dict(
-            path,
-            rect=pymupdf.Rect(path["rect"]),
-            items=[
-                (item[0], pymupdf.Rect(item[1]), *item[2:]) if item[0] == "re" else item
-                for item in path["items"]
-            ],
-        )
-        for path in paths
-    ]
+    # Collection extends path rects and normalizes rectangle items; make_edges
+    # appends closing lines. Other consumers must see the original drawings.
+    return [dict(p, rect=pymupdf.Rect(p["rect"]), items=[
+        (i[0], pymupdf.Rect(i[1]), *i[2:]) if i[0] == "re" else i
+        for i in p["items"]]) for p in paths]
+
+
 
 
 class _TableStateList:
@@ -1648,11 +1680,7 @@ class TableHeader:
 
 
 def _cells_to_rows(cells):
-    """Canonical row order and None gap slots for a flat cell list.
-
-    Each row holds one slot per distinct cell x0 on the table, so a gap and a
-    span both appear as None. Shared by Table.rows and the union stage, which
-    needs the same grid before a Table exists."""
+    """Canonical row ordering and None slots for Table and union admission."""
     _sorted = sorted(cells, key=itemgetter(1, 0))
     xs = list(sorted(set(map(itemgetter(0), cells))))
     rows = []
@@ -1662,8 +1690,6 @@ def _cells_to_rows(cells):
         rows.append(row)
     return rows
 
-
-_NO_HEADER_YET = object()  # Table.header has not been computed yet
 
 
 class Table:
@@ -1677,9 +1703,6 @@ class Table:
         # (its layout box) is decoupled from its replacement cell grid.
         self._bbox = bbox
         self._header = _NO_HEADER_YET
-        # The header rules read the page through the two global text-extraction
-        # toggles that were in force when this table was detected, so a header
-        # computed on first access has to put them back. Both are plain getters.
         self._header_flags = (
             bool(pymupdf.TOOLS.set_small_glyph_heights()),
             bool(pymupdf.TOOLS.unset_quad_corrections()),
@@ -1859,6 +1882,9 @@ class Table:
         td-only table is built from :meth:`extract`.
         """
         if self.placements is not None:
+            for row in self.placements:
+                for cell in row:
+                    cell.validate_source_content()
             return render_table_html(self.placements, self.section_rows)
         # No placements: flat td-only grid from extract().
         rows = [
@@ -2246,6 +2272,10 @@ class TableFinder:
         self.page = weakref.proxy(page)
         self.textpage = None
         self.settings = TableSettings.resolve(settings)
+        # Preserve source segments before snapping/joining can mix a genuine
+        # rule with a synthetic envelope. These are the existing converted edges.
+        self.ruling_evidence = tuple(dict(e) for e in EDGES
+                                    if e.get("ruling_origin") in ("vector", "raster"))
         self.edges = self.get_edges()
         self.intersections = edges_to_intersections(
             self.edges,
@@ -2255,8 +2285,6 @@ class TableFinder:
         self.cells = intersections_to_cells(self.intersections)
         groups = cells_to_tables(self.page, self.cells)
         if cell_group_filter is not None:
-            # Internal hook: the union stage decides admission on the cell groups,
-            # so a rejected candidate never becomes a Table at all.
             groups = cell_group_filter(self.page, groups)
         self.tables = [Table(self.page, group) for group in groups]
 
@@ -2397,6 +2425,7 @@ def make_chars(page, clip=None):
     ctm = page.transformation_matrix
     TEXTPAGE = page.get_textpage(clip=clip, flags=FLAGS)
     blocks = page.get_text("rawdict", textpage=TEXTPAGE)["blocks"]
+    page._table_raw_blocks = blocks
     doctop_base = page_height * page.number
     for block in blocks:
         for line in block["lines"]:
@@ -2447,6 +2476,8 @@ def make_chars(page, clip=None):
                         "y1": bbox_ctm.y1,
                     }
                     chars.append(char_dict)
+    from ._table_font_symbols import control_glyphs
+    page._table_control_glyphs = control_glyphs(page, chars)
     return TEXTPAGE
 
 
@@ -2455,28 +2486,124 @@ def make_chars(page, clip=None):
 # We are ignoring Bézier curves completely and are converting everything
 # else to lines.
 # ------------------------------------------------------------------------
-def _is_line_like(rect, min_length):
-    """Whether a rectangle is thin enough to be a simulated line."""
-    return (rect.width <= min_length and rect.width < rect.height) or (
-        rect.height <= min_length and rect.height < rect.width
-    )
+# ---------------------------------------------------------------------------
+# Ruling-evidence collection boundary (행동 불변 분리, 2026-09-12).
+# make_edges 내부 클로저였던 합성 외곽선 생성(clean_graphics)과 이웃 판정을
+# 모듈 수준으로 순수 이동한 것이다. 상수·호출 순서·동작은 동일하다.
+# 증거 소스 4종과 소비 순서(벡터 l/re/qu -> 합성 외곽선 테두리 -> 사용자/
+# raster 가상선 -> 사용자 박스)는 make_edges에 그대로 남는다. 이 경계는
+# 후속 detect-admission 실험(source-stage evidence 조건)의 부착 지점이다.
+# ---------------------------------------------------------------------------
+def _evidence_are_neighbors(r1, r2, snap_x, snap_y):
+    """Detect whether r1, r2 are neighbors.
+
+    Defined as:
+    The minimum distance between points of r1 and points of r2 is not
+    larger than some delta.
+
+    This check supports empty rect-likes and thus also lines.
+
+    Note:
+    This type of check is MUCH faster than native Rect containment checks.
+    """
+    if (  # check if x-coordinates of r1 are within those of r2
+        r2.x0 - snap_x <= r1.x0 <= r2.x1 + snap_x
+        or r2.x0 - snap_x <= r1.x1 <= r2.x1 + snap_x
+    ) and (  # ... same for y-coordinates
+        r2.y0 - snap_y <= r1.y0 <= r2.y1 + snap_y
+        or r2.y0 - snap_y <= r1.y1 <= r2.y1 + snap_y
+    ):
+        return True
+
+    # same check with r1 / r2 exchanging their roles (this is necessary!)
+    if (
+        r1.x0 - snap_x <= r2.x0 <= r1.x1 + snap_x
+        or r1.x0 - snap_x <= r2.x1 <= r1.x1 + snap_x
+    ) and (
+        r1.y0 - snap_y <= r2.y0 <= r1.y1 + snap_y
+        or r1.y0 - snap_y <= r2.y1 <= r1.y1 + snap_y
+    ):
+        return True
+    return False
 
 
-def _is_batched_rule(rect, min_length):
-    """Whether a rectangle inside a large fill path is a simulated line.
+def _collect_graphic_evidence(page, npaths, *, snap_x, snap_y, min_length,
+                              lines_strict, chars):
+    """Detect and join rectangles of "connected" vector graphics."""
+    if npaths is None:
+        allpaths = _get_table_drawings(page, native=True)
+    else:  # accept passed-in vector graphics
+        allpaths = npaths[:]  # paths relevant for table detection
+    paths = []
+    bbox_paths = []
+    for p in allpaths:
+        # If only looking at lines, ignore large fill-only paths, but
+        # retain line-like rectangle items inside them. Some producers
+        # batch hundreds of thin grid-rule rectangles into one fill path;
+        # its aggregate path bbox is large even though every relevant
+        # item is a simulated horizontal or vertical line.
+        if (
+            lines_strict
+            and p["type"] == "f"
+            and p["rect"].width > snap_x
+            and p["rect"].height > snap_y
+        ):
+            line_items = []
+            for item in p["items"]:
+                if item[0] != "re":
+                    continue
+                rect = item[1].normalize()
+                if (
+                    rect.width <= min_length
+                    and rect.width < rect.height
+                ) or (
+                    rect.height <= min_length
+                    and rect.height < rect.width
+                ):
+                    line_items.append(item)
+            if line_items:
+                line_path = p.copy()
+                line_path["items"] = line_items
+                paths.append(line_path)
+            continue
+        paths.append(p)
+        bbox_paths.append(p)
 
-    A path's aggregate bbox is no evidence about its individual items, so a thin
-    rectangle batched into a large fill can still be a grid rule. A thin *and
-    short* one cannot: dot screens and vector-drawn glyph fragments consist of
-    rectangles that are small in both directions, and a few hundred of them snap
-    and join into one long spurious edge. A rule reaches at least the minimum
-    edge length along its length, which is the same bound filter_edges() applies
-    to the finished edges."""
-    return _is_line_like(rect, min_length) and max(rect.width, rect.height) > min_length
+    # start with all vector graphics rectangles
+    prects = sorted(set([p["rect"] for p in bbox_paths]), key=lambda r: (r.y1, r.x0))
+    new_rects = []  # the final list of joined rectangles
+    # ----------------------------------------------------------------
+    # Strategy: Join rectangles that "almost touch" each other.
+    # Extend first rectangle with any other that is a "neighbor".
+    # Then move it to the final list and continue with the rest.
+    # ----------------------------------------------------------------
+    while prects:  # the algorithm will empty this list
+        prect0 = prects[0]  # copy of first rectangle (performance reasons!)
+        repeat = True
+        while repeat:  # this loop extends first rect in list
+            repeat = False  # set to true again if some other rect touches
+            for i in range(len(prects) - 1, 0, -1):  # run backwards
+                if _evidence_are_neighbors(prect0, prects[i], snap_x, snap_y):  # close enough to rect 0?
+                    prect0 |= prects[i].tl  # extend rect 0
+                    prect0 |= prects[i].br  # extend rect 0
+                    del prects[i]  # delete this rect
+                    repeat = True  # keep checking the rest
+
+        # move rect 0 over to result list if there is some text in it
+        if chars_in_rect(chars, prect0):
+            # contains text, so accept it as a table bbox candidate
+            new_rects.append(prect0)
+        del prects[0]  # remove from rect list
+
+    return new_rects, paths
 
 
-def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes=None):
-    edges = EDGES._list()  # bind once: avoid per-append proxy overhead below
+
+def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes=None,
+               ruling_filter=None):
+    # Convert each input once. The optional union policy consumes these same
+    # native/virtual edges before synthesized envelopes enter the edge stream.
+    edges, origins = [], []
     snap_x = tset.snap_x_tolerance
     snap_y = tset.snap_y_tolerance
     min_length = tset.edge_min_length
@@ -2496,104 +2623,9 @@ def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes
     else:
         clip = prect
 
-    def are_neighbors(r1, r2):
-        """Detect whether r1, r2 are neighbors.
-
-        Defined as:
-        The minimum distance between points of r1 and points of r2 is not
-        larger than some delta.
-
-        This check supports empty rect-likes and thus also lines.
-
-        Note:
-        This type of check is MUCH faster than native Rect containment checks.
-        """
-        if (  # check if x-coordinates of r1 are within those of r2
-            r2.x0 - snap_x <= r1.x0 <= r2.x1 + snap_x
-            or r2.x0 - snap_x <= r1.x1 <= r2.x1 + snap_x
-        ) and (  # ... same for y-coordinates
-            r2.y0 - snap_y <= r1.y0 <= r2.y1 + snap_y
-            or r2.y0 - snap_y <= r1.y1 <= r2.y1 + snap_y
-        ):
-            return True
-
-        # same check with r1 / r2 exchanging their roles (this is necessary!)
-        if (
-            r1.x0 - snap_x <= r2.x0 <= r1.x1 + snap_x
-            or r1.x0 - snap_x <= r2.x1 <= r1.x1 + snap_x
-        ) and (
-            r1.y0 - snap_y <= r2.y0 <= r1.y1 + snap_y
-            or r1.y0 - snap_y <= r2.y1 <= r1.y1 + snap_y
-        ):
-            return True
-        return False
-
-    def clean_graphics(npaths=None):
-        """Detect and join rectangles of "connected" vector graphics."""
-        if npaths is None:
-            allpaths = _get_table_drawings(page, native=True)
-        else:  # accept passed-in vector graphics
-            allpaths = npaths[:]  # paths relevant for table detection
-        paths = []
-        bbox_paths = []  # paths that may contribute an enveloping bbox
-        for p in allpaths:
-            # If only looking at lines, we ignore fill-only paths, except
-            # simulated lines (i.e. small width or height) -- including the ones
-            # batched inside a large path. Some producers put hundreds of thin
-            # grid rules into a single fill path, whose aggregate bbox is large
-            # although every relevant item in it is a simulated line. A path's
-            # bbox is not evidence about its individual items, so drop the path
-            # and keep those items (see _is_batched_rule). They contribute no
-            # enveloping bbox: bbox_paths holds only the paths whose own rect is
-            # real graphics.
-            if (
-                lines_strict
-                and p["type"] == "f"
-                and p["rect"].width > snap_x
-                and p["rect"].height > snap_y
-            ):
-                line_items = [
-                    item
-                    for item in p["items"]
-                    if item[0] == "re" and _is_batched_rule(item[1].normalize(), min_length)
-                ]
-                if line_items:
-                    line_path = p.copy()
-                    line_path["items"] = line_items
-                    paths.append(line_path)
-                continue
-            paths.append(p)
-            bbox_paths.append(p)
-
-        # start with all vector graphics rectangles
-        prects = sorted(set([p["rect"] for p in bbox_paths]), key=lambda r: (r.y1, r.x0))
-        new_rects = []  # the final list of joined rectangles
-        # ----------------------------------------------------------------
-        # Strategy: Join rectangles that "almost touch" each other.
-        # Extend first rectangle with any other that is a "neighbor".
-        # Then move it to the final list and continue with the rest.
-        # ----------------------------------------------------------------
-        while prects:  # the algorithm will empty this list
-            prect0 = prects[0]  # copy of first rectangle (performance reasons!)
-            repeat = True
-            while repeat:  # this loop extends first rect in list
-                repeat = False  # set to true again if some other rect touches
-                for i in range(len(prects) - 1, 0, -1):  # run backwards
-                    if are_neighbors(prect0, prects[i]):  # close enough to rect 0?
-                        prect0 |= prects[i].tl  # extend rect 0
-                        prect0 |= prects[i].br  # extend rect 0
-                        del prects[i]  # delete this rect
-                        repeat = True  # keep checking the rest
-
-            # move rect 0 over to result list if there is some text in it
-            if chars_in_rect(CHARS, prect0):
-                # contains text, so accept it as a table bbox candidate
-                new_rects.append(prect0)
-            del prects[0]  # remove from rect list
-
-        return new_rects, paths
-
-    bboxes, paths = clean_graphics(npaths=paths)
+    bboxes, paths = _collect_graphic_evidence(
+        page, paths, snap_x=snap_x, snap_y=snap_y, min_length=min_length,
+        lines_strict=lines_strict, chars=CHARS)
 
     def is_parallel(p1, p2):
         """Check if line is roughly axis-parallel."""
@@ -2655,6 +2687,11 @@ def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes
         }
         return line_dict
 
+    def append_native(line, item, line_like):
+        edges.append(dict(line_to_edge(line), ruling_origin="vector"))
+        if ruling_filter is not None:
+            origins.append((item, line_like))
+
     for p in paths:
         items = p["items"]  # items in this path
 
@@ -2663,71 +2700,149 @@ def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes
             items.append(("l", items[-1][2], items[0][1]))
 
         for i in items:
+            line_like = i[0] == "l"
             if i[0] not in ("l", "re", "qu"):
                 continue  # ignore anything else
 
             if i[0] == "l":  # a line
                 p1, p2 = i[1:]
-                line_dict = make_line(p, p1, p2, clip)
+                line_path = p
+                # A short butt-capped path can paint a long, thin rule across
+                # its direction. Interpret that existing native stroke before
+                # clipping and the first edge-length filter, like thin fill
+                # rectangles above. Other caps/dashes/compound paths retain
+                # their original representation; no second edge is emitted.
+                stroke = p.get("width", 0) or 0
+                caps = p.get("lineCap")
+                if (p.get("type") == "s" and len(items) == 1
+                        and not p.get("closePath")
+                        and p.get("stroke_opacity", 1) > 0
+                        and caps is not None and len(caps) == 3
+                        and all(cap == 0 for cap in caps)
+                        and "".join(p.get("dashes", "").split()) == "[]0"
+                        and min_length < stroke < float("inf")):
+                    dx, dy = abs(p2.x - p1.x), abs(p2.y - p1.y)
+                    if dy == 0 and 0 < dx <= min_length:
+                        cx, cy = (p1.x + p2.x) / 2, p1.y
+                        p1, p2 = pymupdf.Point(cx, cy - stroke / 2), pymupdf.Point(cx, cy + stroke / 2)
+                        line_path = dict(p, width=dx)
+                    elif dx == 0 and 0 < dy <= min_length:
+                        cx, cy = p1.x, (p1.y + p2.y) / 2
+                        p1, p2 = pymupdf.Point(cx - stroke / 2, cy), pymupdf.Point(cx + stroke / 2, cy)
+                        line_path = dict(p, width=dy)
+                line_dict = make_line(line_path, p1, p2, clip)
                 if line_dict:
-                    edges.append(line_to_edge(line_dict))
+                    append_native(line_dict, i, line_like)
 
             elif i[0] == "re":
                 # A rectangle: decompose into 4 lines, but filter out
                 # the ones that simulate a line
                 rect = i[1].normalize()  # normalize the rectangle
 
-                if _is_line_like(rect, min_length):  # simulates a single line
-                    if rect.width < rect.height:  # a vertical one
-                        x = abs(rect.x1 + rect.x0) / 2  # take middle value for x
-                        p1 = pymupdf.Point(x, rect.y0)
-                        p2 = pymupdf.Point(x, rect.y1)
-                    else:  # a horizontal one
-                        y = abs(rect.y1 + rect.y0) / 2  # take middle value for y
-                        p1 = pymupdf.Point(rect.x0, y)
-                        p2 = pymupdf.Point(rect.x1, y)
+                if (
+                    rect.width <= min_length and rect.width < rect.height
+                ):  # simulates a vertical line
+                    line_like = True
+                    x = abs(rect.x1 + rect.x0) / 2  # take middle value for x
+                    p1 = pymupdf.Point(x, rect.y0)
+                    p2 = pymupdf.Point(x, rect.y1)
                     line_dict = make_line(p, p1, p2, clip)
                     if line_dict:
-                        edges.append(line_to_edge(line_dict))
+                        append_native(line_dict, i, line_like)
+                    continue
+
+                if (
+                    rect.height <= min_length and rect.height < rect.width
+                ):  # simulates a horizontal line
+                    line_like = True
+                    y = abs(rect.y1 + rect.y0) / 2  # take middle value for y
+                    p1 = pymupdf.Point(rect.x0, y)
+                    p2 = pymupdf.Point(rect.x1, y)
+                    line_dict = make_line(p, p1, p2, clip)
+                    if line_dict:
+                        append_native(line_dict, i, line_like)
                     continue
 
                 line_dict = make_line(p, rect.tl, rect.bl, clip)
                 if line_dict:
-                    edges.append(line_to_edge(line_dict))
+                    append_native(line_dict, i, line_like)
 
                 line_dict = make_line(p, rect.bl, rect.br, clip)
                 if line_dict:
-                    edges.append(line_to_edge(line_dict))
+                    append_native(line_dict, i, line_like)
 
                 line_dict = make_line(p, rect.br, rect.tr, clip)
                 if line_dict:
-                    edges.append(line_to_edge(line_dict))
+                    append_native(line_dict, i, line_like)
 
                 line_dict = make_line(p, rect.tr, rect.tl, clip)
                 if line_dict:
-                    edges.append(line_to_edge(line_dict))
+                    append_native(line_dict, i, line_like)
 
             else:  # must be a quad
                 # we convert it into (up to) 4 lines
                 ul, ur, ll, lr = i[1]
+                xs = {p.x for p in (ul, ur, ll, lr)}
+                ys = {p.y for p in (ul, ur, ll, lr)}
+                line_like = (len(xs) == len(ys) == 2
+                             and min(max(xs)-min(xs), max(ys)-min(ys)) <= min_length)
 
                 line_dict = make_line(p, ul, ll, clip)
                 if line_dict:
-                    edges.append(line_to_edge(line_dict))
+                    append_native(line_dict, i, line_like)
 
                 line_dict = make_line(p, ll, lr, clip)
                 if line_dict:
-                    edges.append(line_to_edge(line_dict))
+                    append_native(line_dict, i, line_like)
 
                 line_dict = make_line(p, lr, ur, clip)
                 if line_dict:
-                    edges.append(line_to_edge(line_dict))
+                    append_native(line_dict, i, line_like)
 
                 line_dict = make_line(p, ur, ul, clip)
                 if line_dict:
-                    edges.append(line_to_edge(line_dict))
+                    append_native(line_dict, i, line_like)
 
     path = {"color": (0, 0, 0), "fill": None, "width": 1}
+    extra_edges = []
+    if add_lines is not None:  # add user-specified lines
+        assert isinstance(add_lines, (tuple, list))
+    else:
+        add_lines = []
+    raster_cache = getattr(page, "_pymupdf4llm_raster_table_lines", {})
+    raster_lines = {tuple(tuple(pt) for pt in line) for line in raster_cache.get("lines", ())} if isinstance(raster_cache, dict) else set()
+    for p1, p2 in add_lines:
+        origin = "raster" if (tuple(p1), tuple(p2)) in raster_lines else "user_line"
+        p1 = pymupdf.Point(p1)
+        p2 = pymupdf.Point(p2)
+        line_dict = make_line(path, p1, p2, clip)
+        if line_dict:
+            extra_edges.append(dict(line_to_edge(line_dict), ruling_origin=origin))
+
+    extra_line_count = len(extra_edges)
+    if add_boxes is not None:  # add user-specified rectangles
+        assert isinstance(add_boxes, (tuple, list))
+    else:
+        add_boxes = []
+    for box in add_boxes:
+        r = pymupdf.Rect(box)
+        line_dict = make_line(path, r.tl, r.bl, clip)
+        if line_dict:
+            extra_edges.append(line_to_edge(line_dict))
+        line_dict = make_line(path, r.bl, r.br, clip)
+        if line_dict:
+            extra_edges.append(line_to_edge(line_dict))
+        line_dict = make_line(path, r.br, r.tr, clip)
+        if line_dict:
+            extra_edges.append(line_to_edge(line_dict))
+        line_dict = make_line(path, r.tr, r.tl, clip)
+        if line_dict:
+            extra_edges.append(line_to_edge(line_dict))
+
+    if ruling_filter is not None:
+        edges, bboxes = ruling_filter(
+            page, paths, edges, origins, bboxes, extra_edges, extra_line_count, tset)
+
     for bbox in bboxes:  # add the border lines for all enveloping bboxes
         line_dict = make_line(path, bbox.tl, bbox.tr, clip)
         if line_dict:
@@ -2745,35 +2860,8 @@ def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes
         if line_dict:
             edges.append(line_to_edge(line_dict))
 
-    if add_lines is not None:  # add user-specified lines
-        assert isinstance(add_lines, (tuple, list))
-    else:
-        add_lines = []
-    for p1, p2 in add_lines:
-        p1 = pymupdf.Point(p1)
-        p2 = pymupdf.Point(p2)
-        line_dict = make_line(path, p1, p2, clip)
-        if line_dict:
-            edges.append(line_to_edge(line_dict))
-
-    if add_boxes is not None:  # add user-specified rectangles
-        assert isinstance(add_boxes, (tuple, list))
-    else:
-        add_boxes = []
-    for box in add_boxes:
-        r = pymupdf.Rect(box)
-        line_dict = make_line(path, r.tl, r.bl, clip)
-        if line_dict:
-            edges.append(line_to_edge(line_dict))
-        line_dict = make_line(path, r.bl, r.br, clip)
-        if line_dict:
-            edges.append(line_to_edge(line_dict))
-        line_dict = make_line(path, r.br, r.tr, clip)
-        if line_dict:
-            edges.append(line_to_edge(line_dict))
-        line_dict = make_line(path, r.tr, r.tl, clip)
-        if line_dict:
-            edges.append(line_to_edge(line_dict))
+    edges.extend(extra_edges)
+    EDGES._list().extend(edges)
 
 
 def page_rotation_set0(page):
@@ -2865,6 +2953,8 @@ def _refine_flat_placement_grid(page, cells, col_count):
     ("" for a gap), using the same word source and line builder as resolve_spans.
     Used when span resolution changes the column count."""
     page_words = _refine_page_words(page)
+    from pymupdf._table_spans import _span_grid_supplements, _span_positioned_word_lines
+    supplements = _span_grid_supplements(page, page_words, [c for row in cells for c in row if c is not None])
     grid = []
     for row in cells:
         out = []
@@ -2873,14 +2963,17 @@ def _refine_flat_placement_grid(page, cells, col_count):
                 out.append(SpanCell(bbox=None, text="", colspan=1, rowspan=1))
             else:
                 rect = pymupdf.Rect(cell)
-                line_words = [
-                    _span_word_line_tuple(word)
-                    for _, word in _span_select_words_in_rect(page_words, rect, page=page)
-                ]
+                from pymupdf._table_spans import _span_word_sources
+                selected = _span_select_words_in_rect(page_words, rect)
+                extra = supplements.get(tuple(rect), {})
+                selected.extend((i,page_words[i]) for i in extra)
+                selected.sort(key=lambda item:item[0])
+                line_words = _span_positioned_word_lines(selected, extra)
                 out.append(
                     SpanCell(
                         bbox=tuple(rect),
                         text=_span_words_to_line_text(line_words),
+                        sources=_span_word_sources(page_words, selected, extra),
                         colspan=1,
                         rowspan=1,
                     )
@@ -2909,39 +3002,54 @@ def _refine_placements_text_grid(grid):
     return [[collapse_cell_ws(cell.text) for cell in row] for row in grid]
 
 
-def _refine_tag_grid(grid, top_header_rows):
-    """Set each placement's HTML tag in place: cells in the top header rows
-    become ``th``; every other cell becomes ``td``."""
-    for row_idx, row in enumerate(grid):
-        for cell in row:
-            cell.tag = "th" if row_idx < top_header_rows else "td"
-    return grid
+def _structured_repeated_leading_header_cuts(rows):
+    """Return conservative split rows for an exactly repeated leading header.
 
-
-def _refine_model_grid(page, cells):
-    """The merge-preserved model grid plus the header counts derived from it.
-
-    Returns ``(grid, header_rows, body_start)``. ``grid`` is None when span
-    resolution or the header rules fail. ``header_rows`` is the header finder's
-    own count, where 0 means it found no header row at all; ``body_start`` is
-    that count clamped to [1, rows], which is what the row splitter needs. One
-    resolve_spans pass serves both the header/body boundary and the repeated-
-    header split check, so the split costs no extra pass.
+    Only a multi-column signature in the first three rows is eligible.  Exact
+    case-insensitive repeats must leave at least four rows in every segment, so
+    ordinary repeated body values and adjacent duplicate rows do not split a
+    table.
     """
+    normalized = [
+        tuple(collapse_cell_ws(text).casefold() for text in row)
+        for row in rows
+    ]
+    for seed_index in range(min(3, len(normalized))):
+        signature = normalized[seed_index]
+        nonempty = [text for text in signature if text]
+        if len(nonempty) < 3:
+            continue
+        if sum(any(char.isalpha() for char in text) for text in nonempty) < 2:
+            continue
+        repeats = [
+            row_index
+            for row_index in range(seed_index + 4, len(normalized))
+            if normalized[row_index] == signature
+        ]
+        if not repeats:
+            continue
+        boundaries = [0, *repeats, len(normalized)]
+        if all(
+            end - start >= 4
+            for start, end in zip(boundaries, boundaries[1:])
+        ):
+            return tuple(repeats)
+    return ()
+
+
+def _refine_split_repeated_leading_headers(page, working):
+    """Split a refined grid at exact recurrences of its leading header row."""
     try:
-        grid = _refine_placement_or_flat_grid(page, cells)
-        region = find_header_region(_refine_placements_text_grid(grid))
+        placements = _refine_placement_or_flat_grid(page, working)
+        cuts = _structured_repeated_leading_header_cuts(
+            _refine_placements_text_grid(placements)
+        )
     except Exception:
-        return None, 0, 1
-    header_rows = int(region.top_header_rows)
-    return grid, header_rows, (max(1, min(header_rows, len(cells))) if cells else 0)
-
-
-def _refine_body_start_row(page, cells):
-    """Header/body boundary: resolve the merge-preserved placement grid once and
-    ask the header finder how many leading rows are header, clamped to [1, rows]."""
-    grid, _header_rows, body_start = _refine_model_grid(page, cells)
-    return 1 if grid is None else body_start
+        return [working]
+    if not cuts:
+        return [working]
+    boundaries = (0, *cuts, len(working))
+    return [working[start:end] for start, end in zip(boundaries, boundaries[1:])]
 
 
 def _refine_repeated_leading_header_cuts(rows, header_rows):
@@ -3004,24 +3112,7 @@ def _refine_repeated_leading_header_cuts(rows, header_rows):
         return ()
     return ()
 
-
-def _refine_build_placements(page, working, body_start):
-    """Resolve the final placement grid (strict colspan, header boundary known),
-    run header rules on its own text grid, complete the header under spanning
-    header cells from the grid's spans, tag cells -> (tagged grid, region)."""
-    grid = _refine_placement_or_flat_grid(
-        page, working, strict_colspan=True, header_row_count=body_start
-    )
-    region = find_header_region(_refine_placements_text_grid(grid))
-    # The text-grid rules cannot see spans. A row added here holds at least two
-    # labels, so it is never a section row and the section rows stand.
-    depth = extend_header_leaf_labels(grid, region.top_header_rows)
-    region = HeaderRegion(depth, region.section_header_rows)
-    tagged = _refine_tag_grid(grid, region.top_header_rows)
-    return tagged, region
-
-
-def _refine_grid_tables(page, tab):
+def _refine_native_grid_tables(page, tab):
     """Refine one detected table's grid and yield the resulting tagged tables.
 
     Order: structural split (shaded rows + under-segmented columns), the model
@@ -3073,6 +3164,97 @@ def _refine_grid_tables(page, tab):
         yield new_tab
 
 
+def _refine_tag_grid(grid, top_header_rows):
+    """Set each placement's HTML tag in place: cells in the top header rows
+    become ``th``; every other cell becomes ``td``."""
+    for row_idx, row in enumerate(grid):
+        for cell in row:
+            cell.tag = "th" if row_idx < top_header_rows else "td"
+    return grid
+
+
+def _refine_model_grid(page, cells):
+    """The merge-preserved model grid plus the header counts derived from it.
+
+    Returns ``(grid, header_rows, body_start)``. ``grid`` is None when span
+    resolution or the header rules fail. ``header_rows`` is the header finder's
+    own count, where 0 means it found no header row at all; ``body_start`` is
+    that count clamped to [1, rows], which is what the row splitter needs. One
+    resolve_spans pass serves both the header/body boundary and the repeated-
+    header split check, so the split costs no extra pass.
+    """
+    try:
+        grid = _refine_placement_or_flat_grid(page, cells)
+        region = find_header_region(_refine_placements_text_grid(grid))
+    except Exception:
+        return None, 0, 1
+    header_rows = int(region.top_header_rows)
+    return grid, header_rows, (max(1, min(header_rows, len(cells))) if cells else 0)
+
+
+def _refine_body_start_row(page, cells):
+    """Header/body boundary: resolve the merge-preserved placement grid once and
+    ask the header finder how many leading rows are header, clamped to [1, rows]."""
+    grid, _header_rows, body_start = _refine_model_grid(page, cells)
+    return 1 if grid is None else body_start
+
+
+
+
+def _refine_build_placements(page, working, body_start):
+    """Resolve the final placement grid (strict colspan, header boundary known),
+    run header rules on its own text grid, complete the header under spanning
+    header cells from the grid's spans, tag cells -> (tagged grid, region)."""
+    grid = _refine_placement_or_flat_grid(
+        page, working, strict_colspan=True, header_row_count=body_start
+    )
+    region = find_header_region(_refine_placements_text_grid(grid))
+    from ._table_pipeline import current
+    runtime = current()
+    if runtime is None:
+        # Native 2.0 retains its span-aware header rule. The HTML runtime owns
+        # R6 -> role demotion -> leaf completion -> final missing-value cap.
+        depth = extend_header_leaf_labels(grid, region.top_header_rows)
+        region = HeaderRegion(depth, region.section_header_rows)
+    tagged = _refine_tag_grid(grid, region.top_header_rows)
+    return runtime.build_roles(page, tagged, region) if runtime is not None else (tagged, region)
+
+
+def _refine_grid_tables(page, grid, table_bbox, make_table, *, split_repeated_headers):
+    """Refine a fresh grid and yield tagged tables in the approved order.
+
+    ``make_table(flat, was_split)`` owns each consumer's bbox, empty-cell and
+    provenance policy. Yield after role assignment so the caller can attach
+    its text snapshot before the next segment is processed. The caller also
+    owns page geometry and exception recovery. Resolve helpers at call time
+    to preserve the R6/deferred-role hook on _refine_build_placements.
+    """
+    working = refine_grid_structure(page, grid, table_bbox=table_bbox)
+    from ._table_pipeline import current
+    runtime = current()
+    if runtime is not None:
+        working = runtime.refine_header_band(page, working)
+    body_start = _refine_body_start_row(page, working)
+    working = refine_grid_rows(page, working, header_row_count=body_start)
+    segments = (
+        _refine_split_repeated_leading_headers(page, working)
+        if split_repeated_headers
+        else [working]
+    )
+    was_split = len(segments) > 1
+    for segment in segments:
+        flat = _refine_grid_to_cells(segment)
+        tab = make_table(flat, was_split)
+        start = _refine_body_start_row(page, segment) if was_split else body_start
+        placements, region = _refine_build_placements(page, segment, start)
+        tab.placements = placements
+        tab.header_rows = region.top_header_rows
+        tab.section_rows = region.section_header_rows
+        yield tab
+
+
+
+
 def find_tables(
     page,
     clip=None,
@@ -3102,7 +3284,8 @@ def find_tables(
     use_layout: bool = True,  # gate line-based tables by layout table boxes
     union: bool = False,  # opt-in: fuse layout grids with line-based candidates
     refine: bool = False,  # opt-in: refine each detected table's cell grid
-    _cell_group_filter=None,  # internal: union admission, before Table construction
+    _cell_group_filter=None,  # internal union admission, before Table construction
+    _ruling_filter=None,  # internal union evidence policy; standalone defaults unchanged
 ):
     """Detect and extract tables on a page.
 
@@ -3200,7 +3383,11 @@ def find_tables(
             # the nested finder. Imported here, not at module top, to avoid an
             # import cycle: _table_union imports find_tables back from this module.
             from pymupdf._table_union import _find_tables_union
-            tbf = _find_tables_union(page, add_lines=add_lines, add_boxes=add_boxes)
+            tbf = _find_tables_union(
+                page,
+                add_lines=add_lines,
+                add_boxes=add_boxes,
+            )
             TEXTPAGE = tbf.textpage
         else:
             boxes = []
@@ -3229,6 +3416,7 @@ def find_tables(
                 paths=paths,
                 add_lines=add_lines,
                 add_boxes=add_boxes,
+                ruling_filter=_ruling_filter,
             )  # create lines and curves
 
             tbf = TableFinder(page, settings=tset, cell_group_filter=_cell_group_filter)
@@ -3262,7 +3450,33 @@ def find_tables(
             # as .header_rows/.section_rows.
             refined_tables = []
             for tab in tbf.tables:
-                refined_tables.extend(_refine_grid_tables(page, tab))
+                from ._table_pipeline import current
+                if current() is None:
+                    refined_tables.extend(_refine_native_grid_tables(page, tab))
+                    continue
+                grid = _refine_cells_to_grid(tab.cells)
+                def make_refined_table(flat, was_split):
+                    # Preserve native empty-grid fallback and explicit bbox.
+                    new_tab = (
+                        Table(page, flat, bbox=None if was_split else tab._bbox)
+                        if flat
+                        else tab
+                    )
+                    provenance = dict(getattr(tab, "bbox_provenance", {}))
+                    if was_split:
+                        provenance.update(
+                            bbox_source="find_tables",
+                            bbox_operation="refine_split",
+                            parent_bbox_source=provenance.get("bbox_source", "unknown"),
+                            parent_bbox=list(tab.bbox),
+                        )
+                    new_tab.bbox_provenance = provenance
+                    return new_tab
+
+                refined_tables.extend(_refine_grid_tables(
+                    page, grid, tab.bbox, make_refined_table,
+                    split_repeated_headers=union,
+                ))
             tbf.tables = refined_tables
         if old_xref is not None:
             # The header rules read the page itself -- a pixmap of the top row
@@ -3293,4 +3507,5 @@ def find_tables(
     for table in tbf.tables:
         table.textpage = TEXTPAGE
         table._chars = chars
+        table._ruling_edges = tbf.ruling_evidence
     return tbf

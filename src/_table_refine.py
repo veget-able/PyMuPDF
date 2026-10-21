@@ -34,6 +34,7 @@ find_tables() path.
 import itertools
 import re
 from bisect import bisect_left, bisect_right
+from contextvars import ContextVar
 from math import isfinite
 import pymupdf
 
@@ -51,16 +52,14 @@ import pymupdf
 # pymupdf.table, so refinement needs no CHARS state.
 
 _REFINE_LINE_GAP = 3.0  # center-y gap (points) that groups body words into lines
+_WORD_INDEX_CACHE = ContextVar("pymupdf_table_word_indexes", default=None)
 
 
-# --- word center index: reduce the per-cell word scan to a sorted band -------
 class _WordCenterIndex:
-    """Two sorted word-center axes over a read-only page word list.
+    """Two sorted center axes over an existing, read-only page word list.
 
-    ``candidates(rect)`` returns a superset of the words whose center lies in
-    ``rect``, so every consumer still applies its own membership, blank-text and
-    claiming rules. The original word indices are preserved, including order and
-    duplicates, because they are what identifies a word to its owning cell.
+    Only reduces candidates. Consumers retain their original membership,
+    blank-text and claiming rules. Original indices preserve order/duplicates.
     """
 
     def __init__(self, words):
@@ -77,14 +76,40 @@ class _WordCenterIndex:
         x0, y0, x1, y1 = float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)
         n = len(self.xs)
         if not all(map(isfinite, (x0, y0, x1, y1))):
-            return range(n)  # preserve the consumers' predicates for NaN / Inf
+            return range(n)  # Preserve the original predicates for NaN/Inf.
         if x0 > x1 or y0 > y1:
             return []
         xl, xr = bisect_left(self.xs, (x0, -1)), bisect_right(self.xs, (x1, n))
         yl, yr = bisect_left(self.ys, (y0, -1)), bisect_right(self.ys, (y1, n))
-        # Scan the narrower band: fewer candidates for the same result.
         entries = self.xs[xl:xr] if xr - xl <= yr - yl else self.ys[yl:yr]
         return sorted(i for _center, i in entries)
+
+
+def _word_candidates(words, rect):
+    """Share the index in one HTML read scope; direct calls keep a full scan.
+
+    The approved consumers do not edit word lists or tuples. Replacing the
+    list (new extraction/state) or changing its length constructs a new index.
+    Arbitrary in-place coordinate edits during the read scope are unsupported.
+    """
+    cache = _WORD_INDEX_CACHE.get()
+    if cache is None or not isinstance(words, (list, tuple)):
+        return enumerate(words)
+    key = id(words)
+    entry = cache.get(key)
+    if entry is None or entry[0] is not words or entry[1] != len(words):
+        try:
+            index = _WordCenterIndex(words)
+        except (TypeError, ValueError, OverflowError):
+            index = None  # Nonstandard inputs retain the original scan behavior.
+        entry = cache[key] = (words, len(words), index)
+    index = entry[2]
+    if index is None:
+        return enumerate(words)
+    return ((i, words[i]) for i in index.candidates(rect))
+
+
+# --- word center index: reduce the per-cell word scan to a sorted band -------
 
 
 def _refine_word_index(page, words):
@@ -111,6 +136,8 @@ def _refine_word_index(page, words):
 
 def _refine_word_candidates(page, words, rect):
     """(index, word) pairs that may lie in rect -- a superset of the members."""
+    if _WORD_INDEX_CACHE.get() is not None:
+        return _word_candidates(words, rect)
     index = _refine_word_index(page, words) if page is not None else None
     if index is None:
         return enumerate(words)
@@ -221,9 +248,7 @@ def _refine_words_in_rect(page, rect):
     x0, y0, x1, y1 = float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)
     return [
         (wx0, wy0, wx1, wy1, text)
-        for _, (wx0, wy0, wx1, wy1, text) in _refine_word_candidates(
-            page, _refine_page_words(page), rect
-        )
+        for _, (wx0, wy0, wx1, wy1, text) in _word_candidates(_refine_page_words(page), rect)
         if _refine_word_in_rect(wx0, wy0, wx1, wy1, x0, y0, x1, y1)
     ]
 

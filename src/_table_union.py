@@ -33,7 +33,12 @@ from collections import namedtuple
 
 import pymupdf
 
-from pymupdf.table import CHARS, EDGES, Table, TableFinder, _cells_to_rows, _iou
+from pymupdf.table import CHARS, EDGES, Table, TableFinder, _iou, _cells_to_rows
+
+
+# Optional evidence policy, not an additional P1. The isolated runner scopes it.
+_UNION_RULING_FILTER = None
+_UNION_PICTURE_CONTAINMENT = 0.8
 
 
 # ---------------------------------------------------------------------------
@@ -56,15 +61,38 @@ _UNION_GRID_REF_SPAN_MULT_GATE = True     # reject under-segmented candidate gri
 _UNION_GRID_REF_SPAN_MULT_THRESHOLD = 3.0  # max horizontally-separated span groups per cell
 _UNION_OWNER_CONTAINMENT = 0.85           # min containment for a split candidate's owner
 _UNION_OWNER_AMBIGUOUS_OVERLAP = 0.25     # overlap above which an unowned candidate is suppressed
-_UNION_PICTURE_CONTAINMENT = 0.8          # area fraction that puts a candidate inside a picture
-
-# How a candidate grid's text is laid out; see _union_grid_content_support.
-_UnionContent = namedtuple(
-    "_UnionContent", "supported dense_rows dense_columns concrete slots"
-)
+_UNION_CONTENT_MIN_DENSE_ROWS = 2         # rows with text in at least two cells
+_UNION_CONTENT_MIN_REPEATED_COLS = 2      # columns with text in at least two rows
+_UNION_CONTENT_SINGLE_ROW_MAX_LINES = 2   # one record row may wrap once
 
 
-def _layout_table_grids(page):
+class _TableGridEntry(tuple):
+    """Unchanged (bbox, grid) pair carrying provenance from the actual branch."""
+
+    def __new__(cls, bbox, grid, provenance, *, append_context=None,
+                append_index=None, append_only=False, append_materials=None,
+                append_veto=None, append_decision=None):
+        entry = super().__new__(cls, (bbox, grid))
+        entry.bbox_provenance = dict(provenance)
+        entry.append_context = append_context
+        entry.append_index = append_index
+        entry.append_only = append_only
+        entry.append_materials = append_materials
+        entry.append_veto = append_veto
+        entry.append_decision = append_decision
+        return entry
+
+
+def _entry_with_provenance(entry, **updates):
+    provenance = dict(getattr(entry, "bbox_provenance", {}))
+    provenance.update(updates)
+    return _TableGridEntry(entry[0], entry[1], provenance, **{
+        name: getattr(entry, name, None) for name in
+        ('append_context', 'append_index', 'append_only', 'append_materials',
+         'append_veto', 'append_decision')})
+
+
+def _layout_table_grids_base(page):
     """Primary table grids from the raw layout analyzer result.
 
     Reads page.layout_information in its raw (return_raw=True) form and yields a
@@ -73,7 +101,7 @@ def _layout_table_grids(page):
     layout (reading) order. Boxes without a usable grid are skipped.
     """
     grids = []
-    for group in (page.layout_information or []):
+    for raw_index, group in enumerate(page.layout_information or []):
         if not isinstance(group, dict):
             # The union path needs the raw (return_raw=True) layout form; the
             # normalized [x0, y0, x1, y1, class] tuples carry no table_grid.
@@ -93,20 +121,85 @@ def _layout_table_grids(page):
             for j in range(len(v_lines) - 1):
                 row.append((v_lines[j], h_lines[i], v_lines[j + 1], h_lines[i + 1]))
             grid.append(row)
-        grids.append((pymupdf.Rect(group_bbox[:4]), grid))
+        grids.append(_TableGridEntry(pymupdf.Rect(group_bbox[:4]), grid, {
+            "bbox_source": "gnn", "grid_source": "tgif",
+            "bbox_operation": "gnn_detection", "source_gnn_indices": [raw_index],
+        }))
     return grids
+
+
+def _union_admit_cell_groups(live_page, groups, *, source_paths=()):
+    """Shared native admission on already produced cells and current CHARS."""
+    candidates = []
+    # Match the old bbox dedup order BEFORE P1, not after rejection.
+    kept, seen = [], set()
+    glyphs = None  # Local to this admission call / immutable CHARS state.
+    context = None
+    def get_context():
+        nonlocal context
+        if context is None:
+            from ._table_append_context import AppendContext
+            context = AppendContext(CHARS, EDGES, source_paths,
+                getattr(live_page, '_table_ruling_image_boxes', ()))
+        return context
+    for cells in groups:
+        bbox = pymupdf.Rect(
+            min(c[0] for c in cells), min(c[1] for c in cells),
+            max(c[2] for c in cells), max(c[3] for c in cells))
+        if bbox.is_empty:
+            continue
+        grid = [row.cells for row in _cells_to_rows(cells)]
+        if not grid:
+            continue
+        key = tuple(round(value) for value in bbox)
+        if key in seen:
+            continue
+        seen.add(key)
+        support = None
+        append_only = False
+        if _union_candidate_inside_picture(live_page, bbox):
+            if not _union_grid_has_aligned_text(grid):
+                # An empty input field is not a missing text dimension.
+                # Reuse the positive form proof at the first rejection point.
+                from ._table_append_structure import decide_append
+                proof = decide_append(bbox, grid, get_context().materials)
+                if (proof.rule != 'ruled_form' or proof.evidence['cut']
+                        or not proof.evidence['entry_schema_rows']):
+                    continue
+                append_only = True
+        else:
+            if glyphs is None:
+                glyphs = _UnionGlyphIntervals(CHARS)
+            support = _union_grid_has_2d_content_support(grid, glyphs=glyphs)
+            if not (support
+                    or not _union_candidate_conflicts_with_layout(live_page, bbox, grid)):
+                continue
+        kept.append(cells)
+        candidates.append(_TableGridEntry(bbox, grid, {
+            "bbox_source": "find_tables", "grid_source": "find_tables",
+            "bbox_operation": "line_detection", "source_gnn_indices": [],
+        }))
+        entry = candidates[-1]
+        entry.append_only = append_only
+        entry.append_context = get_context()
+        entry.append_index = context.add(bbox, grid,
+            _union_candidate_inside_picture(live_page, bbox), support)
+        # Early form rescue may already have a proof; ordinary candidates do not
+        # pay for it until they actually request independent-region creation.
+        entry.append_materials = context._materials
+    return kept, candidates
+
 
 
 def _union_line_candidates(page, *, add_lines=None, add_boxes=None):
     """Line-based table candidates for the union stage as ``(bbox, grid)`` pairs.
 
     Runs a nested find_tables (strategy=_UNION_STRATEGY, use_layout=False) and
-    keeps each detected table's bbox and row-major cell grid (None for a gap),
-    deduped by rounded bbox. Caller-supplied virtual lines / boxes are forwarded
-    to that nested finder so they take part in the same union decisions as
-    PDF-native vector rules. Admission (see ``admit``) runs on the finder's cell
-    groups, before a Table is built for any of them. Returns ``(candidates,
-    finder)``; the finder is reused as the returned TableFinder shell.
+    keeps each detected table's bbox and row-major cell grid (Table.rows, None
+    for a gap), deduped by rounded bbox. Caller-supplied virtual lines / boxes
+    are forwarded to that nested finder so they participate in the same union
+    decisions as PDF-native vector rules. Returns ``(candidates, finder)``; the
+    finder is reused as the returned TableFinder shell.
     """
     # Imported here, not at module top, to break the import cycle: this
     # module is itself imported lazily by table.find_tables (union path).
@@ -114,53 +207,16 @@ def _union_line_candidates(page, *, add_lines=None, add_boxes=None):
     candidates = []
 
     def admit(live_page, groups):
-        """Keep the cell groups that may become tables, in detection order.
-
-        A candidate is admitted as before: the line grid is evidence in its own
-        right and the layout model can miss a table entirely. The one exception is
-        a candidate sitting inside a region the layout model called a picture,
-        which has to show table-shaped text instead. That cheap geometric test
-        therefore gates the character scan, and the scan itself is built once for
-        the whole call.
-        """
-        kept = []
-        seen = set()
-        points = None
-        for cells in groups:
-            bbox = pymupdf.Rect(
-                min(cell[0] for cell in cells),
-                min(cell[1] for cell in cells),
-                max(cell[2] for cell in cells),
-                max(cell[3] for cell in cells),
-            )
-            if bbox.is_empty:
-                continue
-            grid = [row.cells for row in _cells_to_rows(cells)]
-            if not grid:
-                continue
-            key = tuple(round(value) for value in bbox)
-            if key in seen:
-                continue
-            if _union_candidate_inside_picture(live_page, bbox):
-                if points is None:
-                    points = _union_char_midpoints()
-                content = _union_grid_content_support(grid, points)
-                # A chart labels one row and one column -- its axes -- and its
-                # partial gridlines leave most slots without a cell. A table has
-                # a header row and a label column that are each at least half
-                # full, and cell coverage that is mostly rectangular.
-                if not (
-                    content.supported
-                    and content.dense_rows >= 2
-                    and content.dense_columns >= 2
-                    and content.concrete * 2 >= content.slots
-                ):
-                    continue
-            # Dedup only admitted candidates: a rejected one must not shadow a
-            # later, differently gridded candidate with the same rounded bbox.
-            seen.add(key)
-            kept.append(cells)
-            candidates.append((bbox, grid))
+        from .table import _cached_table_drawings
+        from ._table_pipeline import current
+        if current() is None:
+            kept, admitted = _union_native_admit_cell_groups(live_page, groups)
+            candidates.extend(admitted)
+            return kept
+        # The actual page (not TableFinder's weak proxy) is still derotated.
+        kept, admitted = _union_admit_cell_groups(live_page, groups,
+                                                 source_paths=_cached_table_drawings(page))
+        candidates.extend(admitted)
         return kept
 
     finder = find_tables(
@@ -170,56 +226,12 @@ def _union_line_candidates(page, *, add_lines=None, add_boxes=None):
         add_lines=add_lines,
         add_boxes=add_boxes,
         _cell_group_filter=admit,
+        _ruling_filter=_UNION_RULING_FILTER,
     )
     if finder is None:
         # Nested detection failure must not leak partially admitted candidates.
         candidates.clear()
     return candidates, finder
-
-
-def _union_rect_area(rect):
-    return max(0.0, float(rect.x1 - rect.x0)) * max(0.0, float(rect.y1 - rect.y0))
-
-
-def _union_intersection_area(left, right):
-    x0 = max(float(left.x0), float(right.x0))
-    y0 = max(float(left.y0), float(right.y0))
-    x1 = min(float(left.x1), float(right.x1))
-    y1 = min(float(left.y1), float(right.y1))
-    if x1 <= x0 or y1 <= y0:
-        return 0.0
-    return (x1 - x0) * (y1 - y0)
-
-
-def _union_x_overlap(left, right):
-    return max(0.0, min(float(left.x1), float(right.x1)) - max(float(left.x0), float(right.x0)))
-
-
-def _union_find_owner(candidate_bbox, existing_bboxes):
-    """The primary a split candidate belongs inside, plus an ambiguity flag.
-
-    Returns ``(owner_index, ambiguous)``: owner is the best-contained primary
-    (candidate>=_UNION_OWNER_CONTAINMENT inside it), else None; ambiguous is True
-    when the candidate overlaps some primary enough to be unsafe to append."""
-    candidate_area = _union_rect_area(candidate_bbox)
-    if candidate_area <= 0:
-        return None, True
-    best_owner = None
-    best_containment = 0.0
-    ambiguous = False
-    for index, existing_bbox in enumerate(existing_bboxes):
-        existing_area = _union_rect_area(existing_bbox)
-        inter_area = _union_intersection_area(candidate_bbox, existing_bbox)
-        if inter_area <= 0 or existing_area <= 0:
-            continue
-        candidate_containment = inter_area / candidate_area
-        existing_coverage = inter_area / existing_area
-        if candidate_containment >= _UNION_OWNER_CONTAINMENT and candidate_containment > best_containment:
-            best_owner = index
-            best_containment = candidate_containment
-        elif candidate_containment >= _UNION_OWNER_AMBIGUOUS_OVERLAP or existing_coverage >= _UNION_OWNER_AMBIGUOUS_OVERLAP:
-            ambiguous = True
-    return best_owner, ambiguous
 
 
 def _union_char_midpoints():
@@ -241,7 +253,6 @@ def _union_char_midpoints():
         points.append((v_mid, h_mid))
     points.sort()
     return points
-
 
 def _union_grid_content_support(grid, points):
     """How a candidate line grid's text is distributed, in one scan.
@@ -311,12 +322,66 @@ def _union_grid_content_support(grid, points):
     )
 
 
+_UnionContent = namedtuple(
+    "_UnionContent", "supported dense_rows dense_columns concrete slots"
+)
+
+def _union_native_admit_cell_groups(live_page, groups):
+    """Keep the cell groups that may become tables, in detection order.
+
+    A candidate is admitted as before: the line grid is evidence in its own
+    right and the layout model can miss a table entirely. The one exception is
+    a candidate sitting inside a region the layout model called a picture,
+    which has to show table-shaped text instead. That cheap geometric test
+    therefore gates the character scan, and the scan itself is built once for
+    the whole call.
+    """
+    candidates = []
+    kept = []
+    seen = set()
+    points = None
+    for cells in groups:
+        bbox = pymupdf.Rect(
+            min(cell[0] for cell in cells),
+            min(cell[1] for cell in cells),
+            max(cell[2] for cell in cells),
+            max(cell[3] for cell in cells),
+        )
+        if bbox.is_empty:
+            continue
+        grid = [row.cells for row in _cells_to_rows(cells)]
+        if not grid:
+            continue
+        key = tuple(round(value) for value in bbox)
+        if key in seen:
+            continue
+        if _union_candidate_inside_picture(live_page, bbox):
+            if points is None:
+                points = _union_char_midpoints()
+            content = _union_grid_content_support(grid, points)
+            # A chart labels one row and one column -- its axes -- and its
+            # partial gridlines leave most slots without a cell. A table has
+            # a header row and a label column that are each at least half
+            # full, and cell coverage that is mostly rectangular.
+            if not (
+                content.supported
+                and content.dense_rows >= 2
+                and content.dense_columns >= 2
+                and content.concrete * 2 >= content.slots
+            ):
+                continue
+        # Dedup only admitted candidates: a rejected one must not shadow a
+        # later, differently gridded candidate with the same rounded bbox.
+        seen.add(key)
+        kept.append(cells)
+        candidates.append((bbox, grid))
+    return kept, candidates
+
 def _union_row_points(rects, points):
     """The y-sorted midpoints falling in one grid row's vertical band."""
     y0 = min(float(rect.y0) for _index, rect in rects)
     y1 = max(float(rect.y1) for _index, rect in rects)
     return points[bisect_left(points, (y0,)) : bisect_left(points, (y1,))]
-
 
 def _union_rect_has_point(rect, band):
     """Whether any midpoint of the row band lies in rect (half-open, as extract)."""
@@ -325,6 +390,149 @@ def _union_rect_has_point(rect, band):
         if x0 <= h_mid < x1 and y0 <= v_mid < y1:
             return True
     return False
+
+
+def _union_rect_area(rect):
+    return max(0.0, float(rect.x1 - rect.x0)) * max(0.0, float(rect.y1 - rect.y0))
+
+
+def _union_intersection_area(left, right):
+    x0 = max(float(left.x0), float(right.x0))
+    y0 = max(float(left.y0), float(right.y0))
+    x1 = min(float(left.x1), float(right.x1))
+    y1 = min(float(left.y1), float(right.y1))
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    return (x1 - x0) * (y1 - y0)
+
+
+def _union_x_overlap(left, right):
+    return max(0.0, min(float(left.x1), float(right.x1)) - max(float(left.x0), float(right.x0)))
+
+
+def _union_find_owner(candidate_bbox, existing_bboxes):
+    """The primary a split candidate belongs inside, plus an ambiguity flag.
+
+    Returns ``(owner_index, ambiguous)``: owner is the best-contained primary
+    (candidate>=_UNION_OWNER_CONTAINMENT inside it), else None; ambiguous is True
+    when the candidate overlaps some primary enough to be unsafe to append."""
+    candidate_area = _union_rect_area(candidate_bbox)
+    if candidate_area <= 0:
+        return None, True
+    best_owner = None
+    best_containment = 0.0
+    ambiguous = False
+    for index, existing_bbox in enumerate(existing_bboxes):
+        existing_area = _union_rect_area(existing_bbox)
+        inter_area = _union_intersection_area(candidate_bbox, existing_bbox)
+        if inter_area <= 0 or existing_area <= 0:
+            continue
+        candidate_containment = inter_area / candidate_area
+        existing_coverage = inter_area / existing_area
+        if candidate_containment >= _UNION_OWNER_CONTAINMENT and candidate_containment > best_containment:
+            best_owner = index
+            best_containment = candidate_containment
+        elif candidate_containment >= _UNION_OWNER_AMBIGUOUS_OVERLAP or existing_coverage >= _UNION_OWNER_AMBIGUOUS_OVERLAP:
+            ambiguous = True
+    return best_owner, ambiguous
+
+
+def _union_grid_has_aligned_text(grid):
+    """Independent picture-contained grids need content, not occupied slots.
+
+    Occupied slots or a tiled rectangle alone are not sufficient: diagram
+    shadows can form empty columns and chart rules can cut labels into cells.
+    Require independent text alignment across cells. Sparse tiled matrices
+    require content in distinct columns; an empty shadow strip is not a
+    second text dimension. Preserve complete single-column tables separately.
+    A complete compact or
+    spanning grid may use one aligned row plus the shared 2D topology check.
+    Numeric text is evidence too. None slots do not imply empty area.
+    Characters retain Table.extract's half-open membership. A text band needs
+    a common vertical overlap of at least half its shortest glyph height,
+    independent of absolute font size. Tightening the common intersection
+    prevents a tall glyph from transitively joining separate text rows.
+    """
+
+    cells = [tuple(cell) for row in grid for cell in row
+             if cell is not None and cell[0] < cell[2] and cell[1] < cell[3]]
+    if len(cells) < 2:
+        return False
+    populated = set()
+    assigned = []
+    cuts = []
+    for char in CHARS:
+        text = str(char.get("text") or "")
+        if not text.strip():
+            continue
+        try:
+            x = (float(char["x0"]) + float(char["x1"])) / 2
+            y = (float(char["top"]) + float(char["bottom"])) / 2
+            top = float(char["top"])
+            bottom = float(char["bottom"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not top < bottom:
+            continue
+        owners = [i for i, c in enumerate(cells)
+                  if c[0] <= x < c[2] and c[1] <= y < c[3]]
+        populated.update(owners)
+        if len(owners) == 1:
+            assigned.append((top, bottom, owners[0]))
+            owner = cells[owners[0]]
+            # A glyph split by an internal cell edge is not independent text
+            # in the cells on either side. Keep the original half-open owner,
+            # but do not count this visual band as repeated column evidence.
+            for edge in (owner[0], owner[2]):
+                if float(char['x0']) < edge < float(char['x1']) and any(
+                    c != owner and (c[0] == edge or c[2] == edge)
+                    and c[1] <= y < c[3] for c in cells
+                ):
+                    cuts.append((top, bottom))
+                    break
+    width = len(grid[0]) if grid else 0
+    if width == 1 and len(populated) == len(cells) and not cuts:
+        return True
+    if (len(grid) >= 2 and width >= 2 and not cuts
+            and all(len(row) == width and all(cell is not None for cell in row)
+                    for row in grid)):
+        x_intervals = [(cell[0], cell[2]) for cell in grid[0]]
+        y_intervals = [(row[0][1], row[0][3]) for row in grid]
+        if (len({owner % width for owner in populated}) >= 2
+                and all(a[1] == b[0] for a,b in zip(x_intervals,x_intervals[1:]))
+                and all(a[1] == b[0] for a,b in zip(y_intervals,y_intervals[1:]))
+                and all((cell[0],cell[2]) == x_intervals[c]
+                        and (cell[1],cell[3]) == y_intervals[r]
+                        for r,row in enumerate(grid) for c,cell in enumerate(row))):
+            return True
+    # Keep a common overlap, not the union of intersecting glyph boxes. A
+    # chain of partial overlaps otherwise turns adjacent lines into one row.
+    bands = []
+    for top, bottom, owner in sorted(assigned, key=lambda c: (c[1], c[0], c[2])):
+        height = bottom - top
+        if bands:
+            band = bands[-1]
+            overlap = min(band[1], bottom) - max(band[0], top)
+            if overlap >= 0.5 * min(band[2], height):
+                band[0] = max(band[0], top)
+                band[1] = min(band[1], bottom)
+                band[2] = min(band[2], height)
+                band[3].add(owner)
+                continue
+        bands.append([top, bottom, height, {owner}])
+    aligned_rows = 0
+    for top, bottom, height, row_owners in bands:
+        if any(min(bottom, b) - max(top, t) >= 0.5 * min(height, b-t)
+               for t, b in cuts):
+            continue
+        owners = sorted(row_owners)
+        if any(cells[a][0] >= cells[b][2] or cells[b][0] >= cells[a][2]
+               for j, a in enumerate(owners) for b in owners[:j]):
+            aligned_rows += 1
+    return aligned_rows >= 2 or (
+        aligned_rows >= 1 and len(populated) == len(cells)
+        and _union_grid_has_2d_content_support(grid)
+    )
 
 
 def _union_layout_groups(page):
@@ -349,15 +557,11 @@ def _union_layout_groups(page):
 def _union_candidate_inside_picture(page, candidate_bbox):
     """Whether a candidate sits inside a layout picture group without covering it.
 
-    The layout model classified that region as a picture, so a line grid found
-    almost entirely inside one is as likely to be a chart's gridlines as a table,
-    and overriding the model's verdict needs table-shaped text. The shape, not the
-    amount, is what tells them apart: a chart's text sits along its two axes, so
-    exactly one row and one column are well filled and its partial gridlines leave
-    most of the grid without a cell at all, while a table has a header row and a
-    label column that are each at least half full over mostly complete cell
-    coverage -- which a sparse matrix of scattered marks still satisfies. See the
-    admission rule in _union_line_candidates.
+    Picture classification is not proof that the region is a chart. It selects
+    the content/topology admission check in _union_line_candidates: concrete
+    cell occupancy, a complete tiled grid, or repeated visual text alignment.
+    That check also accepts numeric-only text and uses glyph-height overlap;
+    it does not require a labelled header or a half-full label column.
 
     A candidate larger than the picture contains it instead -- a bordered table
     with an image in one of its cells -- and keeps the ordinary rule.
@@ -377,26 +581,267 @@ def _union_candidate_inside_picture(page, candidate_bbox):
     return False
 
 
-def _union_text_span_rects(page):
-    """Non-empty page text-span rects, cached on the page.
+def _union_text_line_count(intervals):
+    """Count visual text lines from character ``(top, bottom)`` intervals."""
+    if not intervals:
+        return 0
+    count = 0
+    band_top = band_bottom = None
+    for top, bottom in sorted(intervals):
+        if band_top is None:
+            band_top, band_bottom = top, bottom
+            count = 1
+        elif min(bottom, band_bottom) > max(top, band_top):
+            band_top = min(band_top, top)
+            band_bottom = max(band_bottom, bottom)
+        else:
+            band_top, band_bottom = top, bottom
+            count += 1
+    return count
 
-    Drives the grid-ref span-multiplicity gate: every non-blank span as a bare
-    rect."""
-    cached = getattr(page, "_union_text_spans_cache", None)
+
+class _UnionGlyphIntervals:
+    """Read-only glyph snapshot for one candidate-admission invocation.
+
+    Coordinates come from the existing finder CHARS in its current coordinate
+    system, not a new text extraction. NumPy is optional for standalone PyMuPDF;
+    both paths preserve float64/Python-float midpoint and half-open membership.
+    No page/global cache: OCR, rotation and nested finder calls may replace CHARS.
+    """
+
+    def __init__(self, chars):
+        values = []
+        for char in chars:
+            if not str(char.get("text") or "").strip():
+                continue
+            try:
+                x = (float(char["x0"]) + float(char["x1"])) / 2.0
+                y = (float(char["top"]) + float(char["bottom"])) / 2.0
+                top = float(char["top"])
+                bottom = float(char["bottom"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            values.append((x, y, top, bottom))
+        try:
+            import numpy as np
+        except ImportError:
+            self.array = None
+            self.values = values
+        else:
+            self.array = np.asarray(values, dtype="float64").reshape(-1, 4)
+            self.values = None
+
+    def intervals(self, rect):
+        x0, y0, x1, y1 = map(float, rect)
+        if self.array is None:
+            return [(top, bottom) for x, y, top, bottom in self.values
+                    if x >= x0 and x < x1 and y >= y0 and y < y1]
+        x, y, top, bottom = self.array.T
+        keep = (x >= x0) & (x < x1) & (y >= y0) & (y < y1)
+        return list(zip(top[keep].tolist(), bottom[keep].tolist()))
+
+
+def _union_grid_has_2d_content_support(grid, *, glyphs=None):
+    """Whether a line grid has content distributed like a serializable table.
+
+    The primary signal is repeated two-dimensional text. Two bounded topology
+    forms cover grids whose missing horizontal rules hide that repetition:
+    complete colspan grids (for example a spanning header plus one record row),
+    and complete single record rows containing at most one wrapped line.
+
+    Character midpoints follow ``Table.extract()``'s half-open cell-membership
+    rule. ``None`` grid slots are span/gap placeholders, not empty text cells.
+    The decision is candidate-local; page area, Layout ownership, file identity,
+    benchmark GT and virtual-line provenance are not inputs.
+    """
+    populated = []
+    line_counts = []
+    for row in grid:
+        populated_row = []
+        line_count_row = []
+        for cell in row:
+            if cell is None:
+                populated_row.append(False)
+                line_count_row.append(0)
+                continue
+            rect = pymupdf.Rect(cell)
+            if rect.is_empty:
+                populated_row.append(False)
+                line_count_row.append(0)
+                continue
+            if glyphs is None:
+                glyphs = _UnionGlyphIntervals(CHARS)
+            matched_intervals = glyphs.intervals(rect)
+            populated_row.append(bool(matched_intervals))
+            line_count_row.append(_union_text_line_count(matched_intervals))
+        populated.append(populated_row)
+        line_counts.append(line_count_row)
+
+    dense_rows = sum(sum(row) >= 2 for row in populated)
+    max_columns = max((len(row) for row in populated), default=0)
+    repeated_columns = sum(
+        sum(column < len(row) and row[column] for row in populated) >= 2
+        for column in range(max_columns)
+    )
+    if (
+        dense_rows >= _UNION_CONTENT_MIN_DENSE_ROWS
+        and repeated_columns >= _UNION_CONTENT_MIN_REPEATED_COLS
+    ):
+        return True
+
+    content_rows = [index for index, row in enumerate(populated) if any(row)]
+
+    # A spanning cell is measured against the most explicit row's concrete-cell
+    # centers. This distinguishes a real colspan from a None gap in an irregular
+    # grid without treating every placeholder as populated.
+    reference_row = max(
+        grid,
+        key=lambda row: sum(cell is not None for cell in row),
+        default=[],
+    )
+    column_probes = sorted(
+        (float(rect.x0) + float(rect.x1)) / 2.0
+        for cell in reference_row
+        if cell is not None
+        for rect in (pymupdf.Rect(cell),)
+        if not rect.is_empty
+    )
+
+    if len(content_rows) >= 2 and len(content_rows) == len(grid):
+        all_concrete_cells_populated = all(
+            populated[row_index][column_index]
+            for row_index, row in enumerate(grid)
+            for column_index, cell in enumerate(row)
+            if cell is not None
+        )
+        has_multicell_row = any(
+            sum(populated[row_index]) >= 2 for row_index in content_rows
+        )
+        has_populated_colspan = any(
+            populated[row_index][column_index]
+            and sum(float(rect.x0) <= x < float(rect.x1) for x in column_probes) >= 2
+            for row_index, row in enumerate(grid)
+            for column_index, cell in enumerate(row)
+            if cell is not None
+            for rect in (pymupdf.Rect(cell),)
+            if not rect.is_empty
+        )
+        if (
+            all_concrete_cells_populated
+            and has_multicell_row
+            and has_populated_colspan
+        ):
+            return True
+
+    # A one-record/header-row table has no repeated row dimension to measure.
+    # Admit it only when every concrete cell is populated and its text is at
+    # most two visual lines. Empty artifact rows are ignored; long chart/prose
+    # panels therefore fail on their per-cell line structure.
+    if len(content_rows) == 1:
+        row_index = content_rows[0]
+        concrete_columns = [
+            column_index
+            for column_index, cell in enumerate(grid[row_index])
+            if cell is not None
+        ]
+        if (
+            len(concrete_columns) >= 2
+            and all(populated[row_index][column] for column in concrete_columns)
+            and max(line_counts[row_index][column] for column in concrete_columns)
+            <= _UNION_CONTENT_SINGLE_ROW_MAX_LINES
+        ):
+            return True
+
+    return False
+
+
+def _union_candidate_conflicts_with_layout(page, candidate_bbox, grid):
+    """Whether an unsupported candidate would replace independent content.
+
+    Two or more Layout groups are already separate semantic regions. A single
+    picture is not itself a conflict: raster tables and picture-bearing cells
+    are valid table content. Reject the picture case only when the line finder
+    has produced a one-row partition around the whole picture. Such a candidate
+    has neither repeated two-dimensional content nor a second row in its grid;
+    it is the chart / panel false-positive shape this guard is meant to catch.
+
+    A candidate that is merely a subregion of a larger picture remains eligible
+    for raster-table recovery. Zero groups deliberately remains eligible for
+    the GNN-missed-table recovery path, as does one coherent non-picture group.
+    """
+    contained_groups = []
+    for group in (page.layout_information or []):
+        if not isinstance(group, dict):
+            continue
+        group_bbox = group.get("group_bbox")
+        if not group_bbox:
+            continue
+        try:
+            rect = pymupdf.Rect(group_bbox[:4])
+        except (TypeError, ValueError):
+            continue
+        if rect.is_empty:
+            continue
+        h_mid = (float(rect.x0) + float(rect.x1)) / 2.0
+        v_mid = (float(rect.y0) + float(rect.y1)) / 2.0
+        if (
+            h_mid >= float(candidate_bbox.x0)
+            and h_mid < float(candidate_bbox.x1)
+            and v_mid >= float(candidate_bbox.y0)
+            and v_mid < float(candidate_bbox.y1)
+        ):
+            contained_groups.append((group.get("class_name"), rect))
+            if len(contained_groups) >= 2:
+                return True
+
+    if len(contained_groups) != 1 or contained_groups[0][0] != "picture":
+        return False
+    if len(grid) != 1:
+        return False
+    picture_rect = contained_groups[0][1]
+    return (
+        float(picture_rect.x0) >= float(candidate_bbox.x0)
+        and float(picture_rect.y0) >= float(candidate_bbox.y0)
+        and float(picture_rect.x1) <= float(candidate_bbox.x1)
+        and float(picture_rect.y1) <= float(candidate_bbox.y1)
+    )
+
+
+def _union_text_span_records(page):
+    """Shared (rect, text) input for split coherence and span multiplicity.
+
+    Cache lifetime matches the existing page-local span cache. Consumers must
+    not reuse the page's cached extraction across a changed text/geometry state.
+    Keep empty rectangles here: each consumer retains its original filtering.
+    """
+    cached = getattr(page, "_union_text_span_records_cache", None)
     if cached is not None:
         return cached
     spans = []
     for block in page.get_text("dict").get("blocks", []) or []:
         for line in block.get("lines", []) or []:
             for span in line.get("spans", []) or []:
-                if not str(span.get("text") or "").strip():
+                text = str(span.get("text") or "").strip()
+                if not text:
                     continue
                 bbox = span.get("bbox")
                 if not bbox:
                     continue
                 rect = pymupdf.Rect(bbox)
-                if not rect.is_empty:
-                    spans.append(rect)
+                spans.append((rect, text))
+    try:
+        setattr(page, "_union_text_span_records_cache", spans)
+    except Exception:
+        pass
+    return spans
+
+
+def _union_text_span_rects(page):
+    """Non-empty rectangle view of the shared page text-span records."""
+    cached = getattr(page, "_union_text_spans_cache", None)
+    if cached is not None:
+        return cached
+    spans = [rect for rect, _text in _union_text_span_records(page) if not rect.is_empty]
     try:
         setattr(page, "_union_text_spans_cache", spans)
     except Exception:
@@ -468,6 +913,8 @@ def _union_one_to_one_grid_refs(existing, candidates, *, iou_threshold, page, sp
     candidate_matches = {}
     for existing_index, (existing_bbox, _grid) in enumerate(existing):
         for candidate_index, (candidate_bbox, _cgrid) in enumerate(candidates):
+            if getattr(candidates[candidate_index], 'append_only', False):
+                continue
             iou = _iou(existing_bbox, candidate_bbox)
             if iou >= iou_threshold:
                 existing_matches.setdefault(existing_index, []).append((candidate_index, float(iou)))
@@ -489,12 +936,69 @@ def _union_one_to_one_grid_refs(existing, candidates, *, iou_threshold, page, sp
     return refs, consumed
 
 
-def _union_replace_append(existing, candidates, *, page, grid_ref, grid_ref_iou, span_mult_gate, span_mult_threshold):
+class _UnionSelection:
+    """One union call's chosen entries, shared by coherence and recovery.
+
+    Parent keys follow the adapters' existing provenance contract (including
+    last-parent-wins for repeated keys). Normal split groups share the same
+    child list in both views; concatenation keeps mixed/repeated keys separate.
+    No grid, model result, or page state is copied or cached here.
+    """
+    def __init__(self):
+        self.parents = {}
+        self.split_groups = {}
+        self.recovery_groups = {}
+
+    def add(self, parent, children, *, split=False):
+        key = tuple(getattr(parent, "bbox_provenance", {}).get("source_gnn_indices", []))
+        self.parents[key] = parent
+        if children is None:
+            return
+        previous = self.recovery_groups.get(key)
+        self.recovery_groups[key] = children if previous is None else previous + children
+        if split:
+            previous = self.split_groups.get(key)
+            self.split_groups[key] = children if previous is None else previous + children
+
+
+def _union_partition_covers_nodes(parent, children, page):
+    """Do not replace the body by a few isolated ruled bands.
+
+    Reuse Layout node boxes, never resolve a deferred grid to obtain them.
+    Missing node evidence preserves the existing standalone find_tables API.
+    """
+    grid = parent[1]
+    group = vars(grid).get('group') if hasattr(grid, '__dict__') else None
+    if group is None:
+        indices = getattr(parent, 'bbox_provenance', {}).get('source_gnn_indices', [])
+        groups = getattr(page, 'layout_information', None) or []
+        if len(indices) == 1 and 0 <= indices[0] < len(groups):
+            group = groups[indices[0]]
+    boxes = getattr(parent, 'node_bboxes', None)
+    if boxes is None:
+        boxes = group.get('bboxes') if isinstance(group, dict) else None
+    if boxes is None or len(boxes) == 0:
+        return True
+    centers = [((b[0]+b[2])/2, (b[1]+b[3])/2) for b in boxes]
+    # Side nodes remain eligible for the existing content-recovery path, but
+    # their presence must not waive protection of unrelated in-column body
+    # nodes. Count each node once: covered by a child OR outside every child's
+    # x range. This is routing evidence, not proof of eventual cell acceptance.
+    accounted = sum(
+        not any(b[0] <= x < b[2] for b, _ in children)
+        or any(b[0] <= x < b[2] and b[1] <= y < b[3] for b, _ in children)
+        for x, y in centers
+    )
+    return accounted * 2 >= len(centers)
+
+
+def _union_replace_append_base(existing, candidates, *, page, grid_ref, grid_ref_iou, span_mult_gate, span_mult_threshold, _selection=None):
     """Fuse primary and candidate ``(bbox, grid)`` entries.
 
     Applies grid-ref replacement, split replacement (>=2 candidates owned by one
     primary replace it, ordered by y0/x0) and append of unowned candidates,
-    returning the fused entry list in the contractual order."""
+    returning the fused entry list in the contractual order. Optional private
+    ``_selection`` carries the same chosen entries to the adapter consumers."""
     existing_bboxes = [entry[0] for entry in existing]
     if grid_ref:
         grid_refs, consumed = _union_one_to_one_grid_refs(
@@ -514,11 +1018,29 @@ def _union_replace_append(existing, candidates, *, page, grid_ref, grid_ref_iou,
             continue
         owner_index, ambiguous = _union_find_owner(candidate[0], existing_bboxes)
         if owner_index is not None:
-            replacements.setdefault(owner_index, []).append(candidate)
+            if not getattr(candidate, 'append_only', False):
+                replacements.setdefault(owner_index, []).append(candidate)
         elif ambiguous:
             continue  # overlaps a primary but is not contained -> suppress
         else:
-            append_candidates.append(candidate)
+            # Native 2.0 candidates have already passed its public admission
+            # contract. Structured consumers carry an explicit decision context.
+            if not isinstance(candidate, _TableGridEntry):
+                append_candidates.append(candidate)
+                continue
+            # Independent table creation requires a positive structure proof.
+            # Neither no-layout-conflict nor no-known-veto grants permission.
+            # Grid supply/split use their unchanged contracts above.
+            from ._table_append_structure import decide_append
+            context = getattr(candidate, 'append_context', None)
+            if context is not None:
+                candidate.append_decision = context.decide(candidate.append_index)
+            else:
+                candidate.append_decision = decide_append(
+                    candidate[0], candidate[1], getattr(candidate, 'append_materials', None),
+                    external_owner=getattr(candidate, 'append_veto', None))
+            if candidate.append_decision.approved:
+                append_candidates.append(candidate)
     final_replacements = {
         index: sorted(items, key=lambda entry: (float(entry[0].y0), float(entry[0].x0)))
         for index, items in replacements.items()
@@ -526,14 +1048,30 @@ def _union_replace_append(existing, candidates, *, page, grid_ref, grid_ref_iou,
     }
     entries = []
     for index, entry in enumerate(existing):
-        if index in final_replacements:
-            entries.extend(final_replacements[index])
+        chosen = None
+        rejected_partition = (index in final_replacements and not
+                              _union_partition_covers_nodes(entry, final_replacements[index], page))
+        if rejected_partition:
+            entries.append(_entry_with_provenance(entry, bbox_operation="gnn_keep"))
+        elif index in final_replacements:
+            parent = getattr(entry, "bbox_provenance", {})
+            chosen = [_entry_with_provenance(
+                candidate, bbox_operation="union_split",
+                source_gnn_indices=parent.get("source_gnn_indices", []),
+            ) for candidate in final_replacements[index]]
+            entries.extend(chosen)
         elif index in grid_refs:
             # Grid-ref: keep the primary's (layout) bbox, take the candidate grid.
-            entries.append((entry[0], grid_refs[index][1]))
+            provenance = dict(getattr(entry, "bbox_provenance", {}))
+            provenance.update(grid_source="find_tables", bbox_operation="grid_ref")
+            chosen = [_TableGridEntry(entry[0], grid_refs[index][1], provenance)]
+            entries.extend(chosen)
         else:
-            entries.append(entry)
-    entries.extend(append_candidates)
+            entries.append(_entry_with_provenance(entry, bbox_operation="gnn_keep"))
+        if _selection is not None:
+            _selection.add(entry, chosen, split=index in final_replacements and not rejected_partition)
+    entries.extend(_entry_with_provenance(candidate, bbox_operation="union_append")
+                   for candidate in append_candidates)
     return entries
 
 
@@ -550,7 +1088,9 @@ def _find_tables_union(page, *, add_lines=None, add_boxes=None):
         page.get_layout(return_raw=True)
     primaries = _layout_table_grids(page)
     candidates, finder = _union_line_candidates(
-        page, add_lines=add_lines, add_boxes=add_boxes
+        page,
+        add_lines=add_lines,
+        add_boxes=add_boxes,
     )
     entries = _union_replace_append(
         primaries,
@@ -570,10 +1110,25 @@ def _find_tables_union(page, *, add_lines=None, add_boxes=None):
         CHARS.clear()
         finder = TableFinder(page)
     tables = []
-    for bbox, grid in entries:
+    for entry in entries:
+        bbox, grid = entry
         flat = [cell for row in grid for cell in row if cell is not None]
         if not flat:
             continue
-        tables.append(Table(page, flat, bbox=bbox))
+        table = Table(page, flat, bbox=bbox)
+        table.bbox_provenance = dict(getattr(entry, "bbox_provenance", {}))
+        tables.append(table)
     finder.tables = tables
     return finder
+
+
+def _layout_table_grids(page):
+    from ._table_pipeline import current
+    runtime = current()
+    return runtime.pipeline.adapter.primaries(page) if runtime is not None else _layout_table_grids_base(page)
+
+
+def _union_replace_append(existing, candidates, **kwargs):
+    from ._table_pipeline import current
+    runtime = current()
+    return runtime.fuse(existing, candidates, **kwargs) if runtime is not None else _union_replace_append_base(existing, candidates, **kwargs)

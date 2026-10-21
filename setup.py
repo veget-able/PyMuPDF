@@ -275,6 +275,7 @@ if PYMUPDF_SETUP_PATH_4LLM:
     g_requires_dist += [
             'psutil',
             'tabulate',
+            'rapidfuzz>=3',
             ]
     if PYMUPDF_SETUP_REQUIRE_LAYOUT_4LLM != '0':
         g_requires_dist += [
@@ -644,6 +645,13 @@ def build():
         ret.append( (f'{g_root}/src/_table_spans.py', to_dir) )
         ret.append( (f'{g_root}/src/_table_union.py', to_dir) )
         ret.append( (f'{g_root}/src/_table_headers.py', to_dir) )
+        ret.append((f'{g_root}/src/_table_pipeline.py', to_dir))
+        ret.append((f'{g_root}/src/_table_append_context.py', to_dir))
+        ret.append((f'{g_root}/src/_table_append_structure.py', to_dir))
+        ret.append((f'{g_root}/src/_table_component_context.py', to_dir))
+        ret.append((f'{g_root}/src/_table_clip.py', to_dir))
+        ret.append((f'{g_root}/src/_table_font_symbols.py', to_dir))
+        ret.append((f'{g_root}/src/_table_word_geometry.py', to_dir))
         ret.append( (f'{g_root}/src/utils.py', to_dir) )
         ret.append( (f'{g_root}/src/_wxcolors.py', to_dir) )
         ret.append( (f'{g_root}/src/_apply_pages.py', to_dir) )
