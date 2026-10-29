@@ -1,0 +1,8 @@
+{
+  "commits": {
+    "pymupdf": "422dadaf42a39d1c5acf93b0026a2cbdbc00f7b4",
+    "pymupdf4llm": "363f177ef50deb05f07db8bf2061e7b9c8102b07"
+  },
+  "verified_source_files": 48,
+  "source_pair_exact": true
+}
