@@ -12478,6 +12478,25 @@ class Page:
         if rotation == 0:
             return Identity # nothing to do
 
+        # The stock transform is relative to the visible page. Normalize an
+        # offset CropBox on the full MediaBox first, then restore its rotated
+        # visible rectangle. Reuse the existing annotation/link transformation.
+        media = Rect(self.mediabox)
+        full = Rect(media.x0, 0, media.x1, media.height)
+        crop = Rect(self.cropbox)
+        if max(abs(a-b) for a, b in zip(crop, full)) > 1e-3:
+            before = Rect(self.rect)
+            self.set_cropbox(full)
+            local = crop + (-full.x0, -full.y0, -full.x0, -full.y0)
+            rotated_crop = local * self.rotation_matrix
+            result = self.remove_rotation()
+            normalized_full = self.cropbox
+            self.set_cropbox(rotated_crop + (normalized_full.x0, normalized_full.y0,
+                                             normalized_full.x0, normalized_full.y0))
+            assert max(abs(a-b) for a, b in zip(before, self.rect)) <= 1e-3
+            return result
+
+
         quad_annots = {
             mupdf.PDF_ANNOT_HIGHLIGHT,
             mupdf.PDF_ANNOT_UNDERLINE,
