@@ -275,6 +275,9 @@ if PYMUPDF_SETUP_PATH_4LLM:
     g_requires_dist += [
             'psutil',
             'tabulate',
+            'numpy',
+            'onnxruntime',
+            'opencv-python-headless>=4.5',
             ]
     if PYMUPDF_SETUP_REQUIRE_LAYOUT_4LLM != '0':
         g_requires_dist += [
