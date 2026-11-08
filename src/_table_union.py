@@ -730,3 +730,278 @@ def _union_replace_append(existing, candidates, **kwargs):
     from ._table_pipeline import current
     runtime = current()
     return runtime.fuse(existing, candidates, **kwargs) if runtime is not None else _union_replace_append_base(existing, candidates, **kwargs)
+
+
+# Shared structural evidence predicates for installed append/coherence policies.
+
+
+def _union_grid_has_aligned_text(grid):
+    """Independent picture-contained grids need content, not occupied slots.
+
+    Occupied slots or a tiled rectangle alone are not sufficient: diagram
+    shadows can form empty columns and chart rules can cut labels into cells.
+    Require independent text alignment across cells. Sparse tiled matrices
+    require content in distinct columns; an empty shadow strip is not a
+    second text dimension. Preserve complete single-column tables separately.
+    A complete compact or
+    spanning grid may use one aligned row plus the shared 2D topology check.
+    Numeric text is evidence too. None slots do not imply empty area.
+    Characters retain Table.extract's half-open membership. A text band needs
+    a common vertical overlap of at least half its shortest glyph height,
+    independent of absolute font size. Tightening the common intersection
+    prevents a tall glyph from transitively joining separate text rows.
+    """
+
+    cells = [tuple(cell) for row in grid for cell in row
+             if cell is not None and cell[0] < cell[2] and cell[1] < cell[3]]
+    if len(cells) < 2:
+        return False
+    populated = set()
+    assigned = []
+    cuts = []
+    for char in CHARS:
+        text = str(char.get("text") or "")
+        if not text.strip():
+            continue
+        try:
+            x = (float(char["x0"]) + float(char["x1"])) / 2
+            y = (float(char["top"]) + float(char["bottom"])) / 2
+            top = float(char["top"])
+            bottom = float(char["bottom"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not top < bottom:
+            continue
+        owners = [i for i, c in enumerate(cells)
+                  if c[0] <= x < c[2] and c[1] <= y < c[3]]
+        populated.update(owners)
+        if len(owners) == 1:
+            assigned.append((top, bottom, owners[0]))
+            owner = cells[owners[0]]
+            # A glyph split by an internal cell edge is not independent text
+            # in the cells on either side. Keep the original half-open owner,
+            # but do not count this visual band as repeated column evidence.
+            for edge in (owner[0], owner[2]):
+                if float(char['x0']) < edge < float(char['x1']) and any(
+                    c != owner and (c[0] == edge or c[2] == edge)
+                    and c[1] <= y < c[3] for c in cells
+                ):
+                    cuts.append((top, bottom))
+                    break
+    width = len(grid[0]) if grid else 0
+    if width == 1 and len(populated) == len(cells) and not cuts:
+        return True
+    if (len(grid) >= 2 and width >= 2 and not cuts
+            and all(len(row) == width and all(cell is not None for cell in row)
+                    for row in grid)):
+        x_intervals = [(cell[0], cell[2]) for cell in grid[0]]
+        y_intervals = [(row[0][1], row[0][3]) for row in grid]
+        if (len({owner % width for owner in populated}) >= 2
+                and all(a[1] == b[0] for a,b in zip(x_intervals,x_intervals[1:]))
+                and all(a[1] == b[0] for a,b in zip(y_intervals,y_intervals[1:]))
+                and all((cell[0],cell[2]) == x_intervals[c]
+                        and (cell[1],cell[3]) == y_intervals[r]
+                        for r,row in enumerate(grid) for c,cell in enumerate(row))):
+            return True
+    # Keep a common overlap, not the union of intersecting glyph boxes. A
+    # chain of partial overlaps otherwise turns adjacent lines into one row.
+    bands = []
+    for top, bottom, owner in sorted(assigned, key=lambda c: (c[1], c[0], c[2])):
+        height = bottom - top
+        if bands:
+            band = bands[-1]
+            overlap = min(band[1], bottom) - max(band[0], top)
+            if overlap >= 0.5 * min(band[2], height):
+                band[0] = max(band[0], top)
+                band[1] = min(band[1], bottom)
+                band[2] = min(band[2], height)
+                band[3].add(owner)
+                continue
+        bands.append([top, bottom, height, {owner}])
+    aligned_rows = 0
+    for top, bottom, height, row_owners in bands:
+        if any(min(bottom, b) - max(top, t) >= 0.5 * min(height, b-t)
+               for t, b in cuts):
+            continue
+        owners = sorted(row_owners)
+        if any(cells[a][0] >= cells[b][2] or cells[b][0] >= cells[a][2]
+               for j, a in enumerate(owners) for b in owners[:j]):
+            aligned_rows += 1
+    return aligned_rows >= 2 or (
+        aligned_rows >= 1 and len(populated) == len(cells)
+        and _union_grid_has_2d_content_support(grid)
+    )
+
+
+def _union_text_line_count(intervals):
+    """Count visual text lines from character ``(top, bottom)`` intervals."""
+    if not intervals:
+        return 0
+    count = 0
+    band_top = band_bottom = None
+    for top, bottom in sorted(intervals):
+        if band_top is None:
+            band_top, band_bottom = top, bottom
+            count = 1
+        elif min(bottom, band_bottom) > max(top, band_top):
+            band_top = min(band_top, top)
+            band_bottom = max(band_bottom, bottom)
+        else:
+            band_top, band_bottom = top, bottom
+            count += 1
+    return count
+
+
+class _UnionGlyphIntervals:
+    """Read-only glyph snapshot for one candidate-admission invocation.
+
+    Coordinates come from the existing finder CHARS in its current coordinate
+    system, not a new text extraction. NumPy is optional for standalone PyMuPDF;
+    both paths preserve float64/Python-float midpoint and half-open membership.
+    No page/global cache: OCR, rotation and nested finder calls may replace CHARS.
+    """
+
+    def __init__(self, chars):
+        values = []
+        for char in chars:
+            if not str(char.get("text") or "").strip():
+                continue
+            try:
+                x = (float(char["x0"]) + float(char["x1"])) / 2.0
+                y = (float(char["top"]) + float(char["bottom"])) / 2.0
+                top = float(char["top"])
+                bottom = float(char["bottom"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            values.append((x, y, top, bottom))
+        try:
+            import numpy as np
+        except ImportError:
+            self.array = None
+            self.values = values
+        else:
+            self.array = np.asarray(values, dtype="float64").reshape(-1, 4)
+            self.values = None
+
+    def intervals(self, rect):
+        x0, y0, x1, y1 = map(float, rect)
+        if self.array is None:
+            return [(top, bottom) for x, y, top, bottom in self.values
+                    if x >= x0 and x < x1 and y >= y0 and y < y1]
+        x, y, top, bottom = self.array.T
+        keep = (x >= x0) & (x < x1) & (y >= y0) & (y < y1)
+        return list(zip(top[keep].tolist(), bottom[keep].tolist()))
+
+
+def _union_grid_has_2d_content_support(grid, *, glyphs=None):
+    """Whether a line grid has content distributed like a serializable table.
+
+    The primary signal is repeated two-dimensional text. Two bounded topology
+    forms cover grids whose missing horizontal rules hide that repetition:
+    complete colspan grids (for example a spanning header plus one record row),
+    and complete single record rows containing at most one wrapped line.
+
+    Character midpoints follow ``Table.extract()``'s half-open cell-membership
+    rule. ``None`` grid slots are span/gap placeholders, not empty text cells.
+    The decision is candidate-local; page area, Layout ownership, file identity,
+    benchmark GT and virtual-line provenance are not inputs.
+    """
+    populated = []
+    line_counts = []
+    for row in grid:
+        populated_row = []
+        line_count_row = []
+        for cell in row:
+            if cell is None:
+                populated_row.append(False)
+                line_count_row.append(0)
+                continue
+            rect = pymupdf.Rect(cell)
+            if rect.is_empty:
+                populated_row.append(False)
+                line_count_row.append(0)
+                continue
+            if glyphs is None:
+                glyphs = _UnionGlyphIntervals(CHARS)
+            matched_intervals = glyphs.intervals(rect)
+            populated_row.append(bool(matched_intervals))
+            line_count_row.append(_union_text_line_count(matched_intervals))
+        populated.append(populated_row)
+        line_counts.append(line_count_row)
+
+    dense_rows = sum(sum(row) >= 2 for row in populated)
+    max_columns = max((len(row) for row in populated), default=0)
+    repeated_columns = sum(
+        sum(column < len(row) and row[column] for row in populated) >= 2
+        for column in range(max_columns)
+    )
+    if (
+        dense_rows >= _UNION_CONTENT_MIN_DENSE_ROWS
+        and repeated_columns >= _UNION_CONTENT_MIN_REPEATED_COLS
+    ):
+        return True
+
+    content_rows = [index for index, row in enumerate(populated) if any(row)]
+
+    # A spanning cell is measured against the most explicit row's concrete-cell
+    # centers. This distinguishes a real colspan from a None gap in an irregular
+    # grid without treating every placeholder as populated.
+    reference_row = max(
+        grid,
+        key=lambda row: sum(cell is not None for cell in row),
+        default=[],
+    )
+    column_probes = sorted(
+        (float(rect.x0) + float(rect.x1)) / 2.0
+        for cell in reference_row
+        if cell is not None
+        for rect in (pymupdf.Rect(cell),)
+        if not rect.is_empty
+    )
+
+    if len(content_rows) >= 2 and len(content_rows) == len(grid):
+        all_concrete_cells_populated = all(
+            populated[row_index][column_index]
+            for row_index, row in enumerate(grid)
+            for column_index, cell in enumerate(row)
+            if cell is not None
+        )
+        has_multicell_row = any(
+            sum(populated[row_index]) >= 2 for row_index in content_rows
+        )
+        has_populated_colspan = any(
+            populated[row_index][column_index]
+            and sum(float(rect.x0) <= x < float(rect.x1) for x in column_probes) >= 2
+            for row_index, row in enumerate(grid)
+            for column_index, cell in enumerate(row)
+            if cell is not None
+            for rect in (pymupdf.Rect(cell),)
+            if not rect.is_empty
+        )
+        if (
+            all_concrete_cells_populated
+            and has_multicell_row
+            and has_populated_colspan
+        ):
+            return True
+
+    # A one-record/header-row table has no repeated row dimension to measure.
+    # Admit it only when every concrete cell is populated and its text is at
+    # most two visual lines. Empty artifact rows are ignored; long chart/prose
+    # panels therefore fail on their per-cell line structure.
+    if len(content_rows) == 1:
+        row_index = content_rows[0]
+        concrete_columns = [
+            column_index
+            for column_index, cell in enumerate(grid[row_index])
+            if cell is not None
+        ]
+        if (
+            len(concrete_columns) >= 2
+            and all(populated[row_index][column] for column in concrete_columns)
+            and max(line_counts[row_index][column] for column in concrete_columns)
+            <= _UNION_CONTENT_SINGLE_ROW_MAX_LINES
+        ):
+            return True
+
+    return False
