@@ -638,7 +638,24 @@ def _union_replace_append_base(existing, candidates, *, page, grid_ref, grid_ref
         elif ambiguous:
             continue  # overlaps a primary but is not contained -> suppress
         else:
-            append_candidates.append(candidate)
+            # Native 2.0 candidates have already passed its public admission
+            # contract. Structured consumers carry an explicit decision context.
+            if not isinstance(candidate, _TableGridEntry):
+                append_candidates.append(candidate)
+                continue
+            # Independent table creation requires a positive structure proof.
+            # Neither no-layout-conflict nor no-known-veto grants permission.
+            # Grid supply/split use their unchanged contracts above.
+            from ._table_append_structure import decide_append
+            context = getattr(candidate, 'append_context', None)
+            if context is not None:
+                candidate.append_decision = context.decide(candidate.append_index)
+            else:
+                candidate.append_decision = decide_append(
+                    candidate[0], candidate[1], getattr(candidate, 'append_materials', None),
+                    external_owner=getattr(candidate, 'append_veto', None))
+            if candidate.append_decision.approved:
+                append_candidates.append(candidate)
     final_replacements = {
         index: sorted(items, key=lambda entry: (float(entry[0].y0), float(entry[0].x0)))
         for index, items in replacements.items()
