@@ -2456,7 +2456,8 @@ def make_chars(page, clip=None):
                         "y1": bbox_ctm.y1,
                     }
                     chars.append(char_dict)
-    page._table_control_glyphs = []
+    from ._table_font_symbols import control_glyphs
+    page._table_control_glyphs = control_glyphs(page, chars)
     return TEXTPAGE
 
 

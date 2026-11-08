@@ -1,0 +1,19 @@
+{
+  "order": 7,
+  "feature_ids": "T10-cmap",
+  "stage": "자료 생산",
+  "name": "cmap 기호 복원",
+  "branch": "table-experiements/cell-cmap-recovery-20261108",
+  "repositories": [
+    "pymupdf",
+    "pymupdf4llm"
+  ],
+  "prerequisites": "C00 실제 mixed producer·glyph ref/claim 계약",
+  "atomic_scope": "cmap 증거→교정 레코드→실제 glyph 생산·전달을 한 단위로 유지",
+  "status": "SOURCE_PORTED_VALIDATION_PENDING",
+  "baseline_stage": "refine",
+  "reference_source_map_SHA": "75a0f81025e20db3ca52b96ea3e879b19afa863f08626b71741e847afbcaf752",
+  "actual_repository": "pymupdf",
+  "common_base": "f089dc59f0992bd2b7d7f67a7249a79cf6e31168",
+  "scope_note": "Functional body port from frozen P02; composition/independent API validation recorded separately."
+}
