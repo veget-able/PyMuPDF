@@ -1,0 +1,18 @@
+{
+  "order": 1,
+  "feature_ids": "T01",
+  "stage": "input",
+  "name": "벡터 괘선 보완",
+  "branch": "table-experiements/vector-ruling-20261108",
+  "repositories": [
+    "pymupdf"
+  ],
+  "prerequisites": "C00 문자·도형·괘선 입력 계약",
+  "atomic_scope": "기존 fill/벡터→괘선 보완과 출처 보존을 한 기능으로 유지",
+  "status": "SOURCE_PORTED_VALIDATION_PENDING",
+  "baseline_stage": "input",
+  "reference_source_map_SHA": "75a0f81025e20db3ca52b96ea3e879b19afa863f08626b71741e847afbcaf752",
+  "actual_repository": "pymupdf",
+  "common_base": "f089dc59f0992bd2b7d7f67a7249a79cf6e31168",
+  "scope_note": "Functional body port from frozen P02; composition/independent API validation recorded separately."
+}
