@@ -370,7 +370,24 @@ def _span_select_words_in_rect(page_words, rect, *, page=None):
 
 
 def _span_grid_supplements(page, words, rectangles):
-    return {}  # No additional glyph-owned words; real selected-word production retained.
+    """Recover unselected words only with complete, unique glyph containment.
+
+    Existing selected words retain their owner. This stage has the actual final
+    cell rectangles, so it cannot assign one missing word to competing cells.
+    """
+    from ._table_word_geometry import page_word_geometry, glyph_cell_owners
+    selected = {i for rect in rectangles for i,_ in _span_select_words_in_rect(words, pymupdf.Rect(rect), page=page)}
+    if len(selected) == len(words):
+        return {}
+    geometry = page_word_geometry(page, words)
+    supplements = {}
+    for i, boxes in geometry.items():
+        if i in selected:
+            continue
+        owners = glyph_cell_owners(boxes, rectangles)
+        if len(owners) == 1:
+            supplements.setdefault(tuple(rectangles[owners[0]]), {})[i] = boxes
+    return supplements
 
 
 def _span_positioned_word_lines(selected, glyph_boxes=None):

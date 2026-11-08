@@ -1,0 +1,18 @@
+{
+  "order": 8,
+  "feature_ids": "T10-word-owner",
+  "stage": "자료 생산",
+  "name": "glyph 근거 단어 귀속",
+  "branch": "table-experiements/cell-glyph-word-ownership-20261108",
+  "repositories": [
+    "pymupdf"
+  ],
+  "prerequisites": "C00 실제 words/glyph·선택·CellContent·ref/claim 계약",
+  "atomic_scope": "유일 glyph 소속을 이용한 추가 word 귀속; cmap와 필수 병합하지 않음",
+  "status": "SOURCE_PORTED_VALIDATION_PENDING",
+  "baseline_stage": "refine",
+  "reference_source_map_SHA": "75a0f81025e20db3ca52b96ea3e879b19afa863f08626b71741e847afbcaf752",
+  "actual_repository": "pymupdf",
+  "common_base": "f089dc59f0992bd2b7d7f67a7249a79cf6e31168",
+  "scope_note": "Functional body port from frozen P02; composition/independent API validation recorded separately."
+}
