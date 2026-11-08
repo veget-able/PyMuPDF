@@ -3105,7 +3105,8 @@ def _native_refine_grid_tables(page, tab, *, input_grid=None):
         # A split segment has its own header region; without a split this is the
         # boundary the model grid already produced.
         start = _refine_body_start_row(page, segment) if was_split else body_start
-        segment = refine_grid_rows(page, segment, header_row_count=start)
+        segment = (runtime.refine_rows(page, segment, header_row_count=start)
+                   if runtime is not None else refine_grid_rows(page, segment, header_row_count=start))
         flat = _refine_grid_to_cells(segment)
         if not flat and was_split:
             continue  # an all-gap segment produces no table of its own
