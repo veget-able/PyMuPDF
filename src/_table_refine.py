@@ -34,6 +34,7 @@ find_tables() path.
 import itertools
 import re
 from bisect import bisect_left, bisect_right
+from contextvars import ContextVar
 from math import isfinite
 import pymupdf
 
@@ -51,6 +52,7 @@ import pymupdf
 # pymupdf.table, so refinement needs no CHARS state.
 
 _REFINE_LINE_GAP = 3.0  # center-y gap (points) that groups body words into lines
+_WORD_INDEX_CACHE = ContextVar("pymupdf_table_word_indexes", default=None)
 
 
 # --- word center index: reduce the per-cell word scan to a sorted band -------
@@ -111,6 +113,8 @@ def _refine_word_index(page, words):
 
 def _refine_word_candidates(page, words, rect):
     """(index, word) pairs that may lie in rect -- a superset of the members."""
+    if _WORD_INDEX_CACHE.get() is not None:
+        return _word_candidates(words, rect)
     index = _refine_word_index(page, words) if page is not None else None
     if index is None:
         return enumerate(words)
@@ -126,13 +130,15 @@ def _refine_rawdict_spans(page):
     -- the only ones the consumers read."""
     spans = []
     raw = page.get_text("rawdict")
+    from ._table_pipeline import retain_span_material
+    retain_span_material(page, raw.get("blocks", []))
     for block in raw.get("blocks", []):
         if block.get("type") != 0:
             continue
         for line in block.get("lines", []):
             direction = line.get("dir")
             wmode = line.get("wmode")
-            for span in line.get("spans", []):
+            for span_index, span in enumerate(line.get("spans", [])):
                 text = "".join(str(char.get("c", "")) for char in span.get("chars", []))
                 if not text.strip():
                     continue
@@ -142,6 +148,8 @@ def _refine_rawdict_spans(page):
                         "text": text,
                         "dir": direction,
                         "wmode": wmode,
+                        "source_line": line,
+                        "source_span_index": span_index,
                     }
                 )
     return spans
@@ -174,16 +182,16 @@ def _refine_page_words(page):
     cache = getattr(page, "_refine_words_cache", None)
     if cache is not None:
         return cache
-    words = [
-        (float(w[0]), float(w[1]), float(w[2]), float(w[3]), str(w[4]))
-        for w in page.get_text("words")
-        if str(w[4]).strip()
-    ]
+    original_words = [w for w in page.get_text("words") if str(w[4]).strip()]
+    words = [(float(w[0]),float(w[1]),float(w[2]),float(w[3]),str(w[4])) for w in original_words]
+    line_ids = {id(word): (('native_word_line',int(w[5]),int(w[6])),int(w[7]))
+                for word,w in zip(words,original_words) if len(w)>=8}
     rotated_spans = [
         span
         for span in _refine_rawdict_spans(page)
         if _refine_is_vertical_or_rotated(span) and str(span.get("text") or "").strip()
     ]
+    origins = {}
     if rotated_spans:
         rotated_rects = [pymupdf.Rect(span.get("bbox") or []) for span in rotated_spans]
         kept = []
@@ -196,12 +204,27 @@ def _refine_page_words(page):
         for span, rect in zip(rotated_spans, rotated_rects):
             if rect.is_empty:
                 continue
-            kept.append(
-                (float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1), str(span["text"]))
-            )
+            word = (float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1), str(span["text"]))
+            kept.append(word)
+            origins[id(word)] = (span["source_line"], span["source_span_index"], word)
         words = sorted(kept, key=lambda item: (item[1], item[0]))
     try:
         setattr(page, "_refine_words_cache", words)
+        # Actual producer occurrences, retained with the same word-list lifetime.
+        # These are reading-order facts, not word/cell membership guesses.
+        setattr(page, "_refine_word_sources_cache", (words, {
+            i: origins[id(word)] for i, word in enumerate(words) if id(word) in origins
+        }))
+        rotated_line_ids = {}
+        output_lines = {}
+        for i, word in enumerate(words):
+            if id(word) in origins:
+                line, span_index, _ = origins[id(word)]
+                number=rotated_line_ids.setdefault(id(line),len(rotated_line_ids))
+                output_lines[i]=( ('native_rotated_line',number),span_index )
+            elif id(word) in line_ids:
+                output_lines[i]=line_ids[id(word)]
+        setattr(page, '_refine_word_line_ids', (words, output_lines))
     except Exception:
         pass
     return words
@@ -937,3 +960,27 @@ def _refine_grid_to_cells(grid):
         for cell in row
         if cell is not None
     ]
+
+
+def _word_candidates(words, rect):
+    """Share the index in one HTML read scope; direct calls keep a full scan.
+
+    The approved consumers do not edit word lists or tuples. Replacing the
+    list (new extraction/state) or changing its length constructs a new index.
+    Arbitrary in-place coordinate edits during the read scope are unsupported.
+    """
+    cache = _WORD_INDEX_CACHE.get()
+    if cache is None or not isinstance(words, (list, tuple)):
+        return enumerate(words)
+    key = id(words)
+    entry = cache.get(key)
+    if entry is None or entry[0] is not words or entry[1] != len(words):
+        try:
+            index = _WordCenterIndex(words)
+        except (TypeError, ValueError, OverflowError):
+            index = None  # Nonstandard inputs retain the original scan behavior.
+        entry = cache[key] = (words, len(words), index)
+    index = entry[2]
+    if index is None:
+        return enumerate(words)
+    return ((i, words[i]) for i in index.candidates(rect))

@@ -40,6 +40,43 @@ from pymupdf._table_refine import (
 )
 
 
+from dataclasses import dataclass, field
+
+@dataclass(frozen=True)
+class CellSource:
+    """Reference into the exact producer input; retain its lifetime and identity.
+
+    Native word and vertical line indices belong to different lists. GNN node
+    indices belong to their parent/page scope. bbox/text snapshot the consumed
+    value; the collection reference prevents recycled ids or later cache changes
+    from making an unrelated index look identical.
+    """
+    kind: str
+    index: int
+    bbox: tuple
+    text: str
+    collection: object = field(compare=False, repr=False)
+    scope: tuple = ()
+    glyph_boxes: tuple = ()
+
+    def to_record(self):
+        return dict(kind=self.kind, index=self.index, bbox=list(self.bbox),
+                    text=self.text, scope=list(self.scope),
+                    **({"glyph_boxes": [list(b) for b in self.glyph_boxes]} if self.glyph_boxes else {}))
+
+
+@dataclass(frozen=True)
+class CellContent:
+    text: str
+    sources: tuple
+
+
+def _span_word_sources(page_words, selected, glyph_boxes=None):
+    return tuple(CellSource("word", i, tuple(w[:4]), str(w[4]), page_words,
+                            glyph_boxes=(glyph_boxes or {}).get(i, ()))
+                 for i, w in selected)
+
+
 class SpanCell:
     """One reconstructed table cell after span resolution (PyMuPDF extension).
 
@@ -53,12 +90,25 @@ class SpanCell:
     it from the resolved header region so Table.to_html() can serialize the grid
     directly, and a caller building its own grid may set it too."""
 
-    def __init__(self, bbox, text, colspan, rowspan, tag="td"):
+    def __init__(self, bbox, text, colspan, rowspan, tag="td", *, sources=None, content=None):
         self.bbox = bbox
         self.text = text
         self.colspan = colspan
         self.rowspan = rowspan
         self.tag = tag
+        self.source_content = (content if content is not None else
+                               CellContent(text, tuple(sources)) if sources is not None else None)
+
+
+
+    def validate_source_content(self):
+        if self.source_content is not None and self.text != self.source_content.text:
+            raise ValueError("Cell text changed without transferring its source content")
+
+    def clone(self):
+        self.validate_source_content()
+        return SpanCell(self.bbox, self.text, self.colspan, self.rowspan, self.tag,
+                        content=self.source_content)
 
 
 # --- slot geometry: cluster cell edges into column/row boundaries ------------
@@ -199,7 +249,8 @@ def _span_vertical_text_lines(page):
     if cached is not None:
         return cached
     lines = []
-    for block in page.get_text("dict").get("blocks", []):
+    from ._table_pipeline import retain_span_material
+    for block in retain_span_material(page, _retained_span_blocks(page, page.get_text("dict").get("blocks", []))):
         if block.get("type") not in (None, 0):
             continue
         for line in block.get("lines", []):
@@ -219,54 +270,56 @@ def _span_vertical_text_lines(page):
     return lines
 
 
-def _span_vertical_text_for_rect(page, rect, selected_words):
-    """Text of vertical lines centered in rect, when they dominate the rect.
+def _span_vertical_content_for_rect(page, selected_words, page_words, glyph_boxes):
+    """Selected rotated span words in their producer's original line order.
 
-    Returns the stacked line text only if vertical lines are centered in the rect,
-    cover >=60% of the rect's selected words, and carry >=2 tokens; else None so
-    the caller falls back to horizontal line synthesis."""
-    if not selected_words:
-        return None
-    candidates = []
-    for line_rect, text in _span_vertical_text_lines(page):
-        cx = (float(line_rect.x0) + float(line_rect.x1)) * 0.5
-        cy = (float(line_rect.y0) + float(line_rect.y1)) * 0.5
-        if _span_point_in_rect(cx, cy, rect):
-            candidates.append((line_rect, text))
-    if not candidates:
-        return None
-    vertical_hits = 0
-    for _, (wx0, wy0, wx1, wy1, _) in selected_words:
-        cx = (wx0 + wx1) * 0.5
-        cy = (wy0 + wy1) * 0.5
-        if any(_span_point_in_rect(cx, cy, line_rect) for line_rect, _ in candidates):
-            vertical_hits += 1
-    if vertical_hits / max(1, len(selected_words)) < 0.6:
-        return None
-    if sum(len(text.split()) for _, text in candidates) < 2:
-        return None
-    return "\n".join(
-        text
-        for _, text in sorted(
-            candidates,
-            key=lambda item: (float(item[0].x0), -float((item[0].y0 + item[0].y1) * 0.5)),
-        )
-    )
+    Membership was already selected by the caller. Actual RAWDICT line/span
+    occurrences only supply reading order; a line envelope never claims other
+    words or supplies unselected text. Word references remain word references.
+    """
+    material = getattr(page, "_refine_word_sources_cache", None)
+    if material is None or material[0] is not page_words:
+        return None, selected_words
+    groups, remaining = {}, []
+    for index, word in selected_words:
+        origin = material[1].get(index)
+        if (origin is None or index >= len(page_words)
+                or page_words[index] is not word or origin[2] is not word):
+            remaining.append((index, word))
+            continue
+        line, span_index, _ = origin
+        group = groups.setdefault(id(line), (line, []))
+        group[1].append((span_index, index, word))
+    if not groups:
+        return None, remaining
+    ordered = sorted(groups.values(), key=lambda item: (
+        float(_span_line_rect(item[0]).x0),
+        -float((_span_line_rect(item[0]).y0 + _span_line_rect(item[0]).y1) * 0.5),
+    ))
+    selected, text_lines = [], []
+    for _, entries in ordered:
+        entries.sort(key=lambda item: item[0])
+        text_lines.append(" ".join(str(word[4]).strip() for _, _, word in entries))
+        selected.extend((index, word) for _, index, word in entries)
+    content = CellContent("\n".join(text_lines), _span_word_sources(page_words, selected, glyph_boxes))
+    box = _span_rect_union([pymupdf.Rect(word[:4]) for _, word in selected])
+    return (box, content), remaining
 
 
-def _span_words_to_line_text(words):
+def _span_word_line_groups(words):
     """Join center-point-selected cell words into text, re-synthesizing lines.
 
     ``words`` are (y0, x0, y1, text) tuples; they are grouped into lines by an
     adaptive median-height nearest-line rule, each line's words ordered by x, and
     the lines joined by newlines."""
     if not words:
-        return ""
-    heights = [max(0.1, y1 - y0) for y0, _, y1, _ in words]
+        return []
+    heights = [max(0.1, item[2] - item[0]) for item in words]
     median_height = sorted(heights)[len(heights) // 2]
     line_threshold = max(2.0, median_height * 0.55)
     lines = []
-    for y0, x0, y1, text in sorted(words, key=lambda item: (item[0], item[1])):
+    for item in sorted(words, key=lambda item: (item[0], item[1])):
+        y0, x0, y1, text = item[:4]
         cy = (y0 + y1) / 2.0
         best_line = None
         best_distance = line_threshold
@@ -276,15 +329,19 @@ def _span_words_to_line_text(words):
                 best_line = line
                 best_distance = distance
         if best_line is None:
-            lines.append({"center_y": cy, "words": [(x0, text)]})
+            lines.append({"center_y": cy, "words": [(x0, text, item)]})
             continue
-        best_line["words"].append((x0, text))
+        best_line["words"].append((x0, text, item))
         count = len(best_line["words"])
         best_line["center_y"] = (float(best_line["center_y"]) * (count - 1) + cy) / count
-    text_lines = []
-    for line in sorted(lines, key=lambda item: float(item["center_y"])):
-        text_lines.append(" ".join(text for _, text in sorted(line["words"], key=lambda item: item[0])))
-    return "\n".join(text_lines)
+    return [[item for _, _, item in sorted(line["words"], key=lambda item: item[0])]
+            for line in sorted(lines, key=lambda item: float(item["center_y"]))]
+
+
+def _span_words_to_line_text(words):
+    """Serialize the existing line groups; source-aware callers consume groups."""
+    return "\n".join(" ".join(item[3] for item in group)
+                     for group in _span_word_line_groups(words))
 
 
 def _span_word_line_tuple(word):
@@ -312,24 +369,97 @@ def _span_select_words_in_rect(page_words, rect, *, page=None):
     return selected
 
 
-def _span_words_text_for_rect(page, rect, selected_words):
-    """Text for a rect: vertical-line text if it dominates, else line synthesis."""
-    vertical_text = _span_vertical_text_for_rect(page, rect, selected_words)
-    if vertical_text is not None:
-        return vertical_text
-    return _span_words_to_line_text([_span_word_line_tuple(word) for _, word in selected_words])
+def _span_grid_supplements(page, words, rectangles):
+    return {}  # No additional glyph-owned words; real selected-word production retained.
 
 
-def _span_claim_text_in_rect(page, rect, page_words, claimed_words):
+def _span_positioned_word_lines(selected, glyph_boxes=None):
+    lines = []
+    for i, word in selected:
+        boxes = (glyph_boxes or {}).get(i)
+        if boxes:
+            b = (min(b[0] for b in boxes), min(b[1] for b in boxes),
+                 max(b[2] for b in boxes), max(b[3] for b in boxes))
+            word = (*b, word[4])
+        lines.append(_span_word_line_tuple(word))
+    return lines
+
+
+
+def _span_words_text_for_rect(page, rect, selected_words, *, sources=None, page_words=None, glyph_indices=None, glyph_boxes=None):
+    """Serialize selected source runs, then publish exactly their references.
+
+    The rotated run preserves its existing x/bottom-up line order. Horizontal
+    lines retain the existing synthesis. Mixing directions cannot discard an
+    otherwise selected word or glyph, and no missing string is reconstructed.
+    """
+    if page_words is None:
+        cached_words = getattr(page, "_refine_words_cache", None)
+        if cached_words is not None and all(i < len(cached_words) and cached_words[i] is w for i, w in selected_words):
+            page_words = cached_words
+    vertical, horizontal = _span_vertical_content_for_rect(page, selected_words, page_words, glyph_boxes)
+    records = getattr(page, "_table_control_glyphs", ())
+    word_refs = _span_word_sources(page_words, horizontal, glyph_boxes)
+    lines = [item + (ref,) for item, ref in zip(
+        _span_positioned_word_lines(horizontal, glyph_boxes), word_refs)]
+    for index, record in enumerate(records):
+        if glyph_indices is not None and index not in glyph_indices:
+            continue
+        bbox = record['bbox']
+        if not rect.contains(pymupdf.Rect(bbox)):
+            continue
+        # A native word already representing the same position owns it. This
+        # repair only supplies glyphs omitted by native word production.
+        x,y=(bbox[0]+bbox[2])/2,(bbox[1]+bbox[3])/2
+        if any(w[0]<=x<=w[2] and w[1]<=y<=w[3] for w in (page_words or ())):
+            continue
+        if str(record['text']).strip():
+            ref = CellSource('glyph',index,tuple(bbox),record['text'],records,
+                             (*record['font_xrefs'],record['char_index']))
+            lines.append(_span_word_line_tuple((*bbox,record['text'])) + (ref,))
+    groups = _span_word_line_groups(lines)
+    parts = []
+    for group in groups:
+        refs = tuple(item[4] for item in group)
+        content = CellContent(" ".join(item[3] for item in group), refs)
+        box = _span_rect_union([pymupdf.Rect(ref.bbox) for ref in refs])
+        parts.append((box, content))
+    if vertical is not None:
+        key = (float(vertical[0].y0), float(vertical[0].x0))
+        position = next((i for i, item in enumerate(parts)
+                         if (float(item[0].y0), float(item[0].x0)) > key), len(parts))
+        parts.insert(position, vertical)
+    produced = CellContent("\n".join(content.text for _, content in parts),
+                           tuple(ref for _, content in parts for ref in content.sources))
+    if sources is not None:
+        sources.extend(produced.sources)
+    return produced.text
+
+
+
+def _span_claim_text_in_rect(page, rect, page_words, claimed_words, *, sources=None, supplements=None):
     """Text of rect's words, skipping words already claimed and claiming the rest."""
     selected = [
         (index, word)
         for index, word in _span_select_words_in_rect(page_words, rect, page=page)
         if index not in claimed_words
     ]
-    for index, _ in selected:
-        claimed_words.add(index)
-    return _span_words_text_for_rect(page, rect, selected)
+    glyph_boxes = {i:boxes for i,boxes in (supplements or {}).items() if i not in claimed_words}
+    selected_indices = {i for i, _ in selected}
+    selected.extend((i,page_words[i]) for i in glyph_boxes if i not in selected_indices)
+    selected.sort(key=lambda item:item[0])
+    records = getattr(page, "_table_control_glyphs", ())
+    glyph_indices = {i for i,r in enumerate(records) if ('glyph',i) not in claimed_words
+                     and rect.contains(pymupdf.Rect(r['bbox']))}
+    produced = []
+    text = _span_words_text_for_rect(page, rect, selected, sources=produced, page_words=page_words,
+                                     glyph_indices=glyph_indices, glyph_boxes=glyph_boxes)
+    claimed_words.update(ref.index for ref in produced if ref.kind == 'word' and ref.collection is page_words)
+    claimed_words.update(('glyph',ref.index) for ref in produced if ref.kind == 'glyph' and ref.collection is records)
+    if sources is not None:
+        sources.extend(produced)
+    return text
+
 
 
 def _span_text_spans(page):
@@ -341,7 +471,8 @@ def _span_text_spans(page):
     if cached is not None:
         return cached
     spans = []
-    for block in page.get_text("dict").get("blocks", []):
+    from ._table_pipeline import retain_span_material
+    for block in retain_span_material(page, _retained_span_blocks(page, page.get_text("dict").get("blocks", []))):
         for line in block.get("lines", []):
             for span in line.get("spans", []):
                 text = str(span.get("text") or "").strip()
@@ -505,7 +636,7 @@ def _span_allow_header_colspan_merge_with_empty_part(*, reason, page, entries, s
     return not all(part_texts)
 
 
-def resolve_spans(page, cells, *, header_row_count=None, strict_colspan=False):
+def resolve_spans(page, cells, *, header_row_count=None, strict_colspan=False, header_merge_policy=None):
     """Resolve a detected table's merged-cell (colspan/rowspan) structure.
 
     ``cells`` is a row-major grid: a list of rows, each a list of ``[x0, y0, x1,
@@ -562,6 +693,10 @@ def resolve_spans(page, cells, *, header_row_count=None, strict_colspan=False):
                         base=base_cells,
                         body_start=body_start,
                     )
+                    if header_merge_policy is not None:
+                        reject, reason = header_merge_policy(reject, reason, row_idx,
+                            candidate_cols, base_cells, body_start, entries, position,
+                            end_position, page_words, page)
                     if reject and _span_allow_header_colspan_merge_with_empty_part(
                         reason=reason,
                         page=page,
@@ -586,14 +721,30 @@ def resolve_spans(page, cells, *, header_row_count=None, strict_colspan=False):
                 continue
             colspan = _span_covered_slot_count(rect.x0, rect.x1, x_boundaries)
             rowspan = _span_covered_slot_count(rect.y0, rect.y1, y_boundaries)
+            sources = []
+            cell_text = ""
             placement_row.append(
                 SpanCell(
                     bbox=tuple(rect),
-                    text=_span_claim_text_in_rect(page, rect, page_words, claimed_words),
+                    text=cell_text,
+                    sources=sources,
                     colspan=colspan,
                     rowspan=rowspan,
                 )
             )
         placements.append(placement_row)
 
+    rectangles = [c.bbox for row in placements for c in row]
+    supplements = _span_grid_supplements(page, page_words, rectangles)
+    for row in placements:
+        for c in row:
+            sources = []
+            c.text = _span_claim_text_in_rect(page, pymupdf.Rect(c.bbox), page_words, claimed_words,
+                sources=sources, supplements=supplements.get(c.bbox))
+            c.source_content = CellContent(c.text, tuple(sources))
     return placements
+
+
+def _retained_span_blocks(page,blocks):
+    from ._table_pipeline import retain_span_material
+    return retain_span_material(page,blocks)

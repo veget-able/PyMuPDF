@@ -11323,7 +11323,10 @@ class Page:
     def get_layout(self, **kwargs):
         """Try to access layout information."""
         if _layout_enabled and _optional_import('layout') and _get_layout:
-            self.layout_information = _get_layout(self, **kwargs)
+            from ._table_pipeline import current
+            runtime = current()
+            self.layout_information = (_get_layout(self, **kwargs) if runtime is None
+                                       else runtime.predict(self, **kwargs))
 
     @property
     def artbox(self):
@@ -11997,7 +12000,9 @@ class Page:
         mupdf.fz_close_device( dev)
 
     def find_tables(self, **kwargs):
-        return table.find_tables(self, **kwargs)
+        from ._table_pipeline import current
+        runtime = current()
+        return table.find_tables(self, **kwargs) if runtime is None else runtime.find_tables(self, **kwargs)
     
     @property
     def first_annot(self):

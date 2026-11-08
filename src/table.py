@@ -125,42 +125,40 @@ _EDGES_VAR = ContextVar("pymupdf_table_edges", default=None)
 _CHARS_VAR = ContextVar("pymupdf_table_chars", default=None)
 
 
+
+
 def _get_table_drawings(page, *, native=False):
-    """The page's vector drawings, shared within one find_tables() call.
+    """Read-only default get_drawings result within one HTML page extraction.
 
-    One call reads them up to ``1 + 2T`` times -- once to build edges, and once
-    per refined table for shaded rows and for border lines -- and each read walks
-    the whole content stream. find_tables() therefore puts an empty cache on the
-    page for the duration of the call and removes it again, so nothing outlives
-    the call: a page whose content stream is rewritten between calls cannot be
-    served a stale extraction. Calling the public refine helpers directly, with
-    no find_tables() around them, extracts afresh exactly as before.
-
-    ``native=True`` returns per-path copies of the mutated members: make_edges
-    extends path rects, normalizes rectangle items and appends a closing line, so
-    the other consumers must not see its edits. Point and Quad values stay shared
-    because make_edges only reads them.
+    Public/direct consumers outside that read scope still extract afresh.
+    OCR precedes the scope; geometry/content-stream changes use separate keys.
+    In-place PDF stream/resource edits are not supported within the read scope.
+    Text extraction flags and cell/grid changes do not affect vector graphics.
+    native=True isolates the rects/items that the existing edge builder edits.
+    Point/Quad values remain shared because that builder only reads them.
     """
-    cache = getattr(page, "_table_drawings_cache", None)
+    cache = _TABLE_DRAWINGS.get()
     if cache is None:
-        paths = page.get_drawings()
+        # Preserve 2.0's call-local cache for public/native find_tables calls.
+        local = getattr(page, "_table_drawings_cache", None)
+        if local is None:
+            paths = page.get_drawings()
+        else:
+            if not local:
+                local.append(page.get_drawings())
+            paths = local[0]
     else:
-        if not cache:
-            cache.append(page.get_drawings())
-        paths = cache[0]
+        key = _table_drawings_key(page)
+        if key not in cache:
+            cache[key] = page.get_drawings()
+        paths = cache[key]
     if not native:
         return paths
-    return [
-        dict(
-            path,
-            rect=pymupdf.Rect(path["rect"]),
-            items=[
-                (item[0], pymupdf.Rect(item[1]), *item[2:]) if item[0] == "re" else item
-                for item in path["items"]
-            ],
-        )
-        for path in paths
-    ]
+    # Collection extends path rects and normalizes rectangle items; make_edges
+    # appends closing lines. Other consumers must see the original drawings.
+    return [dict(p, rect=pymupdf.Rect(p["rect"]), items=[
+        (i[0], pymupdf.Rect(i[1]), *i[2:]) if i[0] == "re" else i
+        for i in p["items"]]) for p in paths]
 
 
 class _TableStateList:
@@ -1859,6 +1857,9 @@ class Table:
         td-only table is built from :meth:`extract`.
         """
         if self.placements is not None:
+            for row in self.placements:
+                for cell in row:
+                    cell.validate_source_content()
             return render_table_html(self.placements, self.section_rows)
         # No placements: flat td-only grid from extract().
         rows = [
@@ -2012,6 +2013,8 @@ class Table:
         blocks = page.get_text("dict", clip=clip, flags=pymupdf.TEXTFLAGS_TEXT)[
             "blocks"
         ]
+        from ._table_pipeline import retain_span_material
+        retain_span_material(page, blocks)
         # non-empty, non-superscript spans above table, sorted descending by y1
         spans = sorted(
             [
@@ -2242,10 +2245,11 @@ class TableFinder:
     https://github.com/tabulapdf/tabula-extractor/issues/16
     """
 
-    def __init__(self, page, settings=None, *, cell_group_filter=None):
+    def __init__(self, page, settings=None, *, cell_group_filter=None, ruling_evidence=()):
         self.page = weakref.proxy(page)
         self.textpage = None
         self.settings = TableSettings.resolve(settings)
+        self.ruling_evidence = tuple(ruling_evidence)
         self.edges = self.get_edges()
         self.intersections = edges_to_intersections(
             self.edges,
@@ -2257,6 +2261,10 @@ class TableFinder:
         if cell_group_filter is not None:
             # Internal hook: the union stage decides admission on the cell groups,
             # so a rejected candidate never becomes a Table at all.
+            from ._table_pipeline import current
+            runtime = current()
+            if runtime is not None:
+                runtime.accept_ruling_materials(page, self.ruling_evidence)
             groups = cell_group_filter(self.page, groups)
         self.tables = [Table(self.page, group) for group in groups]
 
@@ -2397,6 +2405,7 @@ def make_chars(page, clip=None):
     ctm = page.transformation_matrix
     TEXTPAGE = page.get_textpage(clip=clip, flags=FLAGS)
     blocks = page.get_text("rawdict", textpage=TEXTPAGE)["blocks"]
+    page._table_raw_blocks = blocks
     doctop_base = page_height * page.number
     for block in blocks:
         for line in block["lines"]:
@@ -2447,7 +2456,9 @@ def make_chars(page, clip=None):
                         "y1": bbox_ctm.y1,
                     }
                     chars.append(char_dict)
+    page._table_control_glyphs = []
     return TEXTPAGE
+
 
 
 # ------------------------------------------------------------------------
@@ -2477,6 +2488,7 @@ def _is_batched_rule(rect, min_length):
 
 def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes=None):
     edges = EDGES._list()  # bind once: avoid per-append proxy overhead below
+    edge_start = len(edges)
     snap_x = tset.snap_x_tolerance
     snap_y = tset.snap_y_tolerance
     min_length = tset.edge_min_length
@@ -2727,6 +2739,9 @@ def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes
                 if line_dict:
                     edges.append(line_to_edge(line_dict))
 
+    # Capture only converted vector segments, before synthetic envelopes.
+    ruling_evidence = [dict(e, ruling_origin="vector") for e in edges[edge_start:]]
+
     path = {"color": (0, 0, 0), "fill": None, "width": 1}
     for bbox in bboxes:  # add the border lines for all enveloping bboxes
         line_dict = make_line(path, bbox.tl, bbox.tr, clip)
@@ -2749,12 +2764,20 @@ def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes
         assert isinstance(add_lines, (tuple, list))
     else:
         add_lines = []
+    raster_cache = getattr(page, "_pymupdf4llm_raster_table_lines", {})
+    raster_lines = ({tuple(tuple(pt) for pt in line)
+                     for line in raster_cache.get("lines", ())}
+                    if isinstance(raster_cache, dict) else set())
     for p1, p2 in add_lines:
+        is_raster = (tuple(p1), tuple(p2)) in raster_lines
         p1 = pymupdf.Point(p1)
         p2 = pymupdf.Point(p2)
         line_dict = make_line(path, p1, p2, clip)
         if line_dict:
-            edges.append(line_to_edge(line_dict))
+            edge = line_to_edge(line_dict)
+            edges.append(edge)
+            if is_raster:
+                ruling_evidence.append(dict(edge, ruling_origin="raster"))
 
     if add_boxes is not None:  # add user-specified rectangles
         assert isinstance(add_boxes, (tuple, list))
@@ -2774,6 +2797,8 @@ def make_edges(page, clip=None, tset=None, paths=None, add_lines=None, add_boxes
         line_dict = make_line(path, r.tr, r.tl, clip)
         if line_dict:
             edges.append(line_to_edge(line_dict))
+
+    return tuple(ruling_evidence)
 
 
 def page_rotation_set0(page):
@@ -2865,6 +2890,8 @@ def _refine_flat_placement_grid(page, cells, col_count):
     ("" for a gap), using the same word source and line builder as resolve_spans.
     Used when span resolution changes the column count."""
     page_words = _refine_page_words(page)
+    from pymupdf._table_spans import _span_grid_supplements, _span_positioned_word_lines
+    supplements = _span_grid_supplements(page, page_words, [c for row in cells for c in row if c is not None])
     grid = []
     for row in cells:
         out = []
@@ -2873,14 +2900,17 @@ def _refine_flat_placement_grid(page, cells, col_count):
                 out.append(SpanCell(bbox=None, text="", colspan=1, rowspan=1))
             else:
                 rect = pymupdf.Rect(cell)
-                line_words = [
-                    _span_word_line_tuple(word)
-                    for _, word in _span_select_words_in_rect(page_words, rect, page=page)
-                ]
+                from pymupdf._table_spans import _span_word_sources
+                selected = _span_select_words_in_rect(page_words, rect)
+                extra = supplements.get(tuple(rect), {})
+                selected.extend((i,page_words[i]) for i in extra)
+                selected.sort(key=lambda item:item[0])
+                line_words = _span_positioned_word_lines(selected, extra)
                 out.append(
                     SpanCell(
                         bbox=tuple(rect),
                         text=_span_words_to_line_text(line_words),
+                        sources=_span_word_sources(page_words, selected, extra),
                         colspan=1,
                         rowspan=1,
                     )
@@ -2892,21 +2922,17 @@ def _refine_flat_placement_grid(page, cells, col_count):
 
 
 def _refine_placement_or_flat_grid(page, cells, *, strict_colspan=False, header_row_count=None):
-    """The reconstructed cell grid: resolved SpanCell placements, or the flat 1x1
-    fallback when span resolution changes the column count (grid width != col
-    count). ``strict_colspan``/``header_row_count`` pass straight to resolve_spans."""
-    col_count = max((len(row) for row in cells), default=0)
-    placements = resolve_spans(
-        page, cells, header_row_count=header_row_count, strict_colspan=strict_colspan
-    )
-    if _refine_placement_grid_width(placements) == col_count:
-        return placements
-    return _refine_flat_placement_grid(page, cells, col_count)
+    from ._table_pipeline import current
+    runtime=current()
+    if runtime is None or not hasattr(runtime, 'header_service'):
+        return _produce_placement_or_flat_grid(page,cells,strict_colspan=strict_colspan,header_row_count=header_row_count)
+    return runtime.header_service.placements(page,cells,_produce_placement_or_flat_grid,strict_colspan=strict_colspan,header_row_count=header_row_count)
 
 
 def _refine_placements_text_grid(grid):
-    """Row-major whitespace-collapsed cell text -- the ``[[text]]`` header rules read."""
-    return [[collapse_cell_ws(cell.text) for cell in row] for row in grid]
+    from ._table_pipeline import current
+    runtime=current()
+    return runtime.header_service.text_grid(grid,_native_placements_text_grid) if runtime is not None and hasattr(runtime, "header_service") else _native_placements_text_grid(grid)
 
 
 def _refine_tag_grid(grid, top_header_rows):
@@ -3005,13 +3031,8 @@ def _refine_repeated_leading_header_cuts(rows, header_rows):
     return ()
 
 
-def _refine_build_placements(page, working, body_start):
-    """Resolve the final placement grid (strict colspan, header boundary known),
-    run header rules on its own text grid, complete the header under spanning
-    header cells from the grid's spans, tag cells -> (tagged grid, region)."""
-    grid = _refine_placement_or_flat_grid(
-        page, working, strict_colspan=True, header_row_count=body_start
-    )
+def _native_roles_from_placements(grid):
+    """The original main role producer on an already-produced placement grid."""
     region = find_header_region(_refine_placements_text_grid(grid))
     # The text-grid rules cannot see spans. A row added here holds at least two
     # labels, so it is never a section row and the section rows stand.
@@ -3021,7 +3042,26 @@ def _refine_build_placements(page, working, body_start):
     return tagged, region
 
 
-def _refine_grid_tables(page, tab):
+def _refine_build_placements(page, working, body_start, *, table_bbox=None):
+    """Resolve the final placement grid (strict colspan, header boundary known),
+    run header rules on its own text grid, complete the header under spanning
+    header cells from the grid's spans, tag cells -> (tagged grid, region)."""
+    grid = _refine_placement_or_flat_grid(
+        page, working, strict_colspan=True, header_row_count=body_start
+    )
+    region = find_header_region(_refine_placements_text_grid(grid))
+    from ._table_pipeline import current
+    runtime = current()
+    if runtime is None or not hasattr(runtime, "build_roles"):
+        # Native 2.0 retains its span-aware header rule. The HTML runtime owns
+        # R6 -> role demotion -> leaf completion -> final missing-value cap.
+        depth = extend_header_leaf_labels(grid, region.top_header_rows)
+        region = HeaderRegion(depth, region.section_header_rows)
+    tagged = _refine_tag_grid(grid, region.top_header_rows)
+    return runtime.build_roles(page, tagged, region, table_bbox=table_bbox) if runtime is not None and hasattr(runtime, "build_roles") else (tagged, region)
+
+
+def _native_refine_grid_tables(page, tab, *, input_grid=None):
     """Refine one detected table's grid and yield the resulting tagged tables.
 
     Order: structural split (shaded rows + under-segmented columns), the model
@@ -3032,10 +3072,19 @@ def _refine_grid_tables(page, tab):
     segment; that is the ordinary case of one segment, which yields exactly the
     table the unsplit path produced.
     """
-    grid = _refine_cells_to_grid(tab.cells)
+    grid = _refine_cells_to_grid(tab.cells) if input_grid is None else input_grid
     # The reported bbox (a union grid-ref table's layout box, else the cells'
     # union) bounds the shaded-rectangle search.
     working = refine_grid_structure(page, grid, table_bbox=tab.bbox)
+    from ._table_pipeline import current
+    runtime = current()
+    if runtime is not None:
+        working = runtime.refine_header_band(page, working)
+    from ._table_pipeline import current
+    runtime = current()
+    prepare = getattr(runtime, 'refine_header_band', None)
+    if prepare is not None:
+        working = prepare(page, working)
     model_grid, header_rows, body_start = _refine_model_grid(page, working)
     if model_grid is None:
         body_start = 1
@@ -3067,10 +3116,28 @@ def _refine_grid_tables(page, tab):
         # Build the tagged model on `segment` directly, not on the re-gridded
         # new_tab.cells, so placements match the refined grid.
         placements, region = _refine_build_placements(page, segment, start)
+        if hasattr(tab, "bbox_provenance"):
+            provenance = dict(tab.bbox_provenance)
+            if was_split:
+                provenance.update(bbox_source="find_tables", bbox_operation="refine_split",
+                                  parent_bbox_source=provenance.get("bbox_source", "unknown"),
+                                  parent_bbox=list(tab.bbox))
+            new_tab.bbox_provenance = provenance
         new_tab.placements = placements
         new_tab.header_rows = region.top_header_rows
         new_tab.section_rows = region.section_header_rows
         yield new_tab
+
+
+def _refine_grid_tables(page, tab, *, input_grid=None):
+    from ._table_pipeline import current
+    runtime = current()
+    producer = _native_refine_grid_tables if runtime is None else runtime.refine_table
+    for child in (producer(page, tab) if input_grid is None else
+                  producer(page, tab, input_grid=input_grid)):
+        if runtime is not None:
+            runtime.roles.observe(child.placements, HeaderRegion(child.header_rows, child.section_rows))
+        yield child
 
 
 def find_tables(
@@ -3226,7 +3293,7 @@ def find_tables(
             page.table_settings = tset
 
             TEXTPAGE = make_chars(page, clip=clip)  # create character list of page
-            make_edges(
+            ruling_evidence = make_edges(
                 page,
                 clip=clip,
                 tset=tset,
@@ -3235,7 +3302,8 @@ def find_tables(
                 add_boxes=add_boxes,
             )  # create lines and curves
 
-            tbf = TableFinder(page, settings=tset, cell_group_filter=_cell_group_filter)
+            tbf = TableFinder(page, settings=tset, cell_group_filter=_cell_group_filter,
+                              ruling_evidence=ruling_evidence)
             tbf.textpage = TEXTPAGE  # store textpage for later use
             if boxes:
                 # only keep Finder tables that match a layout box
@@ -3297,4 +3365,118 @@ def find_tables(
     for table in tbf.tables:
         table.textpage = TEXTPAGE
         table._chars = chars
+        table._ruling_edges = tbf.ruling_evidence
     return tbf
+
+
+def _produce_placement_or_flat_grid(page, cells, *, strict_colspan=False, header_row_count=None):
+    """The reconstructed cell grid: resolved SpanCell placements, or the flat 1x1
+    fallback when span resolution changes the column count (grid width != col
+    count). ``strict_colspan``/``header_row_count`` pass straight to resolve_spans."""
+    col_count = max((len(row) for row in cells), default=0)
+    from ._table_pipeline import current
+    runtime=current()
+    placements = resolve_spans(
+        page, cells, header_row_count=header_row_count, strict_colspan=strict_colspan,
+        header_merge_policy=getattr(runtime, "strict_span_policy", None),
+    )
+    if _refine_placement_grid_width(placements) == col_count:
+        return placements
+    return _refine_flat_placement_grid(page, cells, col_count)
+
+
+def _native_placements_text_grid(grid):
+    """Row-major whitespace-collapsed cell text -- the ``[[text]]`` header rules read."""
+    return [[collapse_cell_ws(cell.text) for cell in row] for row in grid]
+
+
+
+
+
+def _refine_split_repeated_leading_headers(page, working):
+    grid, depth, _ = _refine_model_grid(page, working)
+    cuts = (_refine_repeated_leading_header_cuts(_refine_placements_text_grid(grid), depth)
+            if grid is not None else ())
+    boundaries = (0, *cuts, len(working))
+    return [working[start:end] for start, end in zip(boundaries, boundaries[1:])]
+
+
+def _structured_refine_grid_tables(page, grid, table_bbox, make_table, *, split_repeated_headers):
+    """Refine a fresh grid and yield tagged tables in the approved order.
+
+    ``make_table(flat, was_split)`` owns each consumer's bbox, empty-cell and
+    provenance policy. Yield after role assignment so the caller can attach
+    its text snapshot before the next segment is processed. The caller also
+    owns page geometry and exception recovery. Resolve helpers at call time
+    to preserve the R6/deferred-role hook on _refine_build_placements.
+    """
+    from ._table_pipeline import current
+    from contextlib import nullcontext
+    runtime = current()
+    with runtime.header_service.refinement_scope() if runtime is not None else nullcontext():
+        working = refine_grid_structure(page, grid, table_bbox=table_bbox)
+        if runtime is not None and hasattr(runtime, "refine_header_band"):
+            working = runtime.refine_header_band(page, working)
+        body_start = runtime.structural_boundary(page, working, consumer="row", table_bbox=table_bbox) if runtime is not None else _refine_body_start_row(page, working)
+        working = (runtime.refine_rows(page, working, header_row_count=body_start)
+                   if runtime is not None else refine_grid_rows(page, working, header_row_count=body_start))
+        segments = _refine_split_repeated_leading_headers(page, working) if split_repeated_headers else [working]
+        was_split = len(segments) > 1
+        for segment in segments:
+            flat = _refine_grid_to_cells(segment)
+            tab = make_table(flat, was_split)
+            start = runtime.structural_boundary(page, segment, consumer="span", table_bbox=tab.bbox) if runtime is not None else (_refine_body_start_row(page, segment) if was_split else body_start)
+            # The current non-strict segment supplies its existing semantic
+            # roles before strict span editing. Row protection is a separate
+            # request; unchanged input reuses prepared data and actual queries.
+            placements, region = _refine_build_placements(page, segment, start, table_bbox=tab.bbox)
+            tab.placements = placements
+            tab.header_rows = region.top_header_rows
+            tab.section_rows = region.section_header_rows
+            yield tab
+
+
+def _cached_table_drawings(page):
+    """Producer snapshot for the exact state; never trigger PDF extraction."""
+    cache = _TABLE_DRAWINGS.get()
+    if cache is not None:
+        return cache.get(_table_drawings_key(page), ())
+    cached = getattr(page, "_table_drawings_cache", None)
+    return cached[0] if cached else ()
+
+scoped_placement_grid = _refine_placement_or_flat_grid
+scoped_build_placements = _refine_build_placements
+scoped_refine_grid_tables = _structured_refine_grid_tables
+
+_native_header_region = find_header_region
+
+def scoped_header_region(rows):
+    from ._table_pipeline import current
+    runtime=current()
+    return runtime.header_service.bootstrap_region(rows,_native_header_region) if runtime is not None and hasattr(runtime, "header_service") else _native_header_region(rows)
+
+find_header_region = scoped_header_region
+
+from ._table_refine import _WORD_INDEX_CACHE
+_TABLE_DRAWINGS = ContextVar("pymupdf_table_drawings", default=None)
+
+def _table_drawings_key(page):
+    return (page, page.rotation, tuple(page.rect), tuple(page.cropbox),
+            tuple(page.mediabox), tuple(page.get_contents()))
+
+from contextlib import contextmanager
+
+@contextmanager
+def _html_table_scope():
+    """Share read-only drawings and word indexes through HTML reconstruction.
+
+    Table.header uses the 2.0 lazy property on every path; the HTML pipeline
+    consumes placements and does not request the legacy header.
+    """
+    drawings_token = _TABLE_DRAWINGS.set({})
+    words_token = _WORD_INDEX_CACHE.set({})
+    try:
+        yield
+    finally:
+        _WORD_INDEX_CACHE.reset(words_token)
+        _TABLE_DRAWINGS.reset(drawings_token)

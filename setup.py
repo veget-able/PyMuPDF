@@ -644,6 +644,13 @@ def build():
         ret.append( (f'{g_root}/src/_table_spans.py', to_dir) )
         ret.append( (f'{g_root}/src/_table_union.py', to_dir) )
         ret.append( (f'{g_root}/src/_table_headers.py', to_dir) )
+        table_compatibility_modules = {
+            '_table_refine.py', '_table_spans.py', '_table_union.py', '_table_headers.py',
+        }
+        for table_module in pipcl.git_items(f'{g_root}/src'):
+            if (table_module.startswith('_table_') and table_module.endswith('.py')
+                    and '/' not in table_module and table_module not in table_compatibility_modules):
+                ret.append((f'{g_root}/src/{table_module}', to_dir))
         ret.append( (f'{g_root}/src/utils.py', to_dir) )
         ret.append( (f'{g_root}/src/_wxcolors.py', to_dir) )
         ret.append( (f'{g_root}/src/_apply_pages.py', to_dir) )
