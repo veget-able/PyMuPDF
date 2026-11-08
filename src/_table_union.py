@@ -320,7 +320,7 @@ def _union_native_admit_cell_groups(live_page, groups):
         # later, differently gridded candidate with the same rounded bbox.
         seen.add(key)
         kept.append(cells)
-        candidates.append(_TableGridEntry(bbox, grid, dict(bbox_source="find_tables", grid_source="find_tables", bbox_operation="line_candidate", source_gnn_indices=[])))
+        candidates.append((bbox, grid))
     return kept, candidates
 
 def _union_row_points(rects, points):
