@@ -3117,9 +3117,7 @@ def _native_refine_grid_tables(page, tab, *, input_grid=None):
     else:
         # The model grid has one row per row of `working`, so its cut indices
         # index `working` directly.
-        cuts = _refine_repeated_leading_header_cuts(
-            _refine_placements_text_grid(model_grid), header_rows
-        )
+        cuts = _structured_repeated_leading_header_cuts(_refine_placements_text_grid(model_grid))
     if cuts:
         boundaries = (0, *cuts, len(working))
         segments = [working[start:end] for start, end in zip(boundaries, boundaries[1:])]
@@ -3420,9 +3418,16 @@ def _native_placements_text_grid(grid):
 
 
 def _refine_split_repeated_leading_headers(page, working):
-    grid, depth, _ = _refine_model_grid(page, working)
-    cuts = (_refine_repeated_leading_header_cuts(_refine_placements_text_grid(grid), depth)
-            if grid is not None else ())
+    """Split a refined grid at exact recurrences of its leading header row."""
+    try:
+        placements = _refine_placement_or_flat_grid(page, working)
+        cuts = _structured_repeated_leading_header_cuts(
+            _refine_placements_text_grid(placements)
+        )
+    except Exception:
+        return [working]
+    if not cuts:
+        return [working]
     boundaries = (0, *cuts, len(working))
     return [working[start:end] for start, end in zip(boundaries, boundaries[1:])]
 
@@ -3506,3 +3511,39 @@ def _html_table_scope():
     finally:
         _WORD_INDEX_CACHE.reset(words_token)
         _TABLE_DRAWINGS.reset(drawings_token)
+
+
+def _structured_repeated_leading_header_cuts(rows):
+    """Return conservative split rows for an exactly repeated leading header.
+
+    Only a multi-column signature in the first three rows is eligible.  Exact
+    case-insensitive repeats must leave at least four rows in every segment, so
+    ordinary repeated body values and adjacent duplicate rows do not split a
+    table.
+    """
+    normalized = [
+        tuple(collapse_cell_ws(text).casefold() for text in row)
+        for row in rows
+    ]
+    for seed_index in range(min(3, len(normalized))):
+        signature = normalized[seed_index]
+        nonempty = [text for text in signature if text]
+        if len(nonempty) < 3:
+            continue
+        if sum(any(char.isalpha() for char in text) for text in nonempty) < 2:
+            continue
+        repeats = [
+            row_index
+            for row_index in range(seed_index + 4, len(normalized))
+            if normalized[row_index] == signature
+        ]
+        if not repeats:
+            continue
+        boundaries = [0, *repeats, len(normalized)]
+        if all(
+            end - start >= 4
+            for start, end in zip(boundaries, boundaries[1:])
+        ):
+            return tuple(repeats)
+    return ()
+

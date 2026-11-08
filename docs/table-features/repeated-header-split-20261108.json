@@ -1,0 +1,19 @@
+{
+  "order": 11,
+  "feature_ids": "T17",
+  "stage": "split",
+  "name": "반복 헤더 표 분리",
+  "branch": "table-experiements/repeated-header-split-20261108",
+  "repositories": [
+    "pymupdf",
+    "pymupdf4llm"
+  ],
+  "prerequisites": "C00 현재 working-grid/원문·cut 소비 계약",
+  "atomic_scope": "반복 cut 책임만; T15 행 보정/T19 방향 분할과 별도 유지",
+  "status": "SOURCE_PORTED_VALIDATION_PENDING",
+  "baseline_stage": "refine",
+  "reference_source_map_SHA": "75a0f81025e20db3ca52b96ea3e879b19afa863f08626b71741e847afbcaf752",
+  "actual_repository": "pymupdf",
+  "common_base": "f089dc59f0992bd2b7d7f67a7249a79cf6e31168",
+  "scope_note": "Functional body port from frozen P02; composition/independent API validation recorded separately."
+}
