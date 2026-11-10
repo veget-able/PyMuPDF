@@ -664,7 +664,6 @@ def build():
         ret.append( (f'{g_root}/src/_table_refine.py', to_dir) )
         ret.append( (f'{g_root}/src/_table_spans.py', to_dir) )
         ret.append( (f'{g_root}/src/_table_union.py', to_dir) )
-        ret.append( (f'{g_root}/src/_table_raster.py', to_dir) )
         ret.append( (f'{g_root}/src/_table_headers.py', to_dir) )
         ret.append( (f'{g_root}/src/utils.py', to_dir) )
         ret.append( (f'{g_root}/src/_wxcolors.py', to_dir) )
