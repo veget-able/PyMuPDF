@@ -484,6 +484,13 @@ def _union_one_to_one_grid_refs(existing, candidates, *, iou_threshold, page, sp
             span_mult = _union_span_multiplicity(page, candidates[candidate_index][1])
             if span_mult is not None and span_mult >= span_mult_threshold:
                 continue
+            # A ruled grid must not merge text groups that the primary separates.
+            primary = existing[existing_index][1]
+            candidate = candidates[candidate_index][1]
+            if max(map(len, candidate), default=0) < max(map(len, primary), default=0):
+                primary_mult = _union_span_multiplicity(page, primary)
+                if primary_mult is not None and span_mult is not None and span_mult > primary_mult:
+                    continue
         refs[existing_index] = candidates[candidate_index]
         consumed.add(candidate_index)
     return refs, consumed
