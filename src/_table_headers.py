@@ -321,7 +321,7 @@ def reference_formula_header_row_like(candidate: list[str], following_rows: list
     if len(following_rows) < 2:
         return False
 
-    following_profiles = row_profiles(following_rows)
+    following_profiles = row_profiles(following_rows[:5])
     body_features = body_window_features_from_profiles(following_profiles, 0)
     if body_window_is_stable(body_features):
         return True
@@ -392,7 +392,7 @@ def next_header_row_value_guard(candidate: list[str], following_rows: list[list[
 
     if len(following_rows) < 2:
         return False
-    following_profiles = row_profiles(following_rows)
+    following_profiles = row_profiles(following_rows[:4])
     body_features = body_window_features_from_profiles(following_profiles, 0)
     if not body_window_is_stable(body_features):
         return False
@@ -436,7 +436,7 @@ def sparse_prefix_conservative_extension_guard(rows: list[list[str]], top_header
         return False
     if section_label_row_like(candidate):
         return False
-    following_profiles = row_profiles(rows[2:])
+    following_profiles = row_profiles(rows[2:6])
     body_features = body_window_features_from_profiles(following_profiles, 0)
     return body_window_is_stable(body_features)
 
@@ -480,7 +480,7 @@ def rowspan_leaf_header_guard(rows: list[list[str]], top_header_rows: int) -> bo
     if section_label_row_like(candidate) or dense_numeric_row_like(candidate):
         return False
 
-    following_profiles = row_profiles(rows[2:])
+    following_profiles = row_profiles(rows[2:6])
     body_features = body_window_features_from_profiles(following_profiles, 0)
     return body_window_is_stable(body_features)
 
@@ -821,7 +821,7 @@ def _undertag_extension_candidate(row: list[str], following_rows: list[list[str]
     if features["avg_tokens"] > 8.0 or features["long_text_type_ratio"] >= 0.35:
         reasons.append("long_text_row")
     if len(following_rows) >= 2:
-        following_profiles = row_profiles(following_rows)
+        following_profiles = row_profiles(following_rows[:4])
         body_features = body_window_features_from_profiles(following_profiles, 0)
         if not body_window_is_stable(body_features):
             reasons.append("following_body_not_stable")
@@ -868,7 +868,8 @@ def find_top_header_rows_by_body_change(
     if len(rows) == 1:
         return 1
 
-    profiles = row_profiles(rows)
+    # Candidate starts are 1..5 and each body window has four rows.
+    profiles = row_profiles(rows[:9])
     candidates = body_start_candidates(profiles)
     for candidate in candidates:
         body_start = int(candidate["body_start"])
