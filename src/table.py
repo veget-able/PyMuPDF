@@ -3012,7 +3012,18 @@ def _refine_tag_grid(grid, top_header_rows):
     return grid
 
 
-def _refine_model_grid(page, cells):
+def _refine_header_region(grid, header_regions=None):
+    """Reuse a pure text-grid decision only within the current table refinement."""
+    rows = _refine_placements_text_grid(grid)
+    if header_regions is None:
+        return find_header_region(rows)
+    key = tuple(tuple(row) for row in rows)
+    if key not in header_regions:
+        header_regions[key] = find_header_region(rows)
+    return header_regions[key]
+
+
+def _refine_model_grid(page, cells, *, header_regions=None):
     """The merge-preserved model grid plus the header counts derived from it.
 
     Returns ``(grid, header_rows, body_start)``. ``grid`` is None when span
@@ -3024,17 +3035,17 @@ def _refine_model_grid(page, cells):
     """
     try:
         grid = _refine_placement_or_flat_grid(page, cells)
-        region = find_header_region(_refine_placements_text_grid(grid))
+        region = _refine_header_region(grid, header_regions)
     except Exception:
         return None, 0, 1
     header_rows = int(region.top_header_rows)
     return grid, header_rows, (max(1, min(header_rows, len(cells))) if cells else 0)
 
 
-def _refine_body_start_row(page, cells):
+def _refine_body_start_row(page, cells, *, header_regions=None):
     """Header/body boundary: resolve the merge-preserved placement grid once and
     ask the header finder how many leading rows are header, clamped to [1, rows]."""
-    grid, _header_rows, body_start = _refine_model_grid(page, cells)
+    grid, _header_rows, body_start = _refine_model_grid(page, cells, header_regions=header_regions)
     return 1 if grid is None else body_start
 
 
@@ -3099,14 +3110,14 @@ def _refine_repeated_leading_header_cuts(rows, header_rows):
     return ()
 
 
-def _refine_build_placements(page, working, body_start):
+def _refine_build_placements(page, working, body_start, *, header_regions=None):
     """Resolve the final placement grid (strict colspan, header boundary known),
     run header rules on its own text grid, complete the header under spanning
     header cells from the grid's spans, tag cells -> (tagged grid, region)."""
     grid = _refine_placement_or_flat_grid(
         page, working, strict_colspan=True, header_row_count=body_start
     )
-    region = find_header_region(_refine_placements_text_grid(grid))
+    region = _refine_header_region(grid, header_regions)
     # The text-grid rules cannot see spans. A row added here holds at least two
     # labels, so it is never a section row and the section rows stand.
     depth = extend_header_leaf_labels(grid, region.top_header_rows)
@@ -3130,7 +3141,10 @@ def _refine_grid_tables(page, tab):
     # The reported bbox (a union grid-ref table's layout box, else the cells'
     # union) bounds the shaded-rectangle search.
     working = refine_grid_structure(page, grid, table_bbox=tab.bbox)
-    model_grid, header_rows, body_start = _refine_model_grid(page, working)
+    header_regions = {}
+    model_grid, header_rows, body_start = _refine_model_grid(
+        page, working, header_regions=header_regions
+    )
     if model_grid is None:
         body_start = 1
         cuts = ()
@@ -3149,7 +3163,10 @@ def _refine_grid_tables(page, tab):
     for segment in segments:
         # A split segment has its own header region; without a split this is the
         # boundary the model grid already produced.
-        start = _refine_body_start_row(page, segment) if was_split else body_start
+        start = (
+            _refine_body_start_row(page, segment, header_regions=header_regions)
+            if was_split else body_start
+        )
         segment = refine_grid_rows(page, segment, header_row_count=start)
         flat = _refine_grid_to_cells(segment)
         if not flat and was_split:
@@ -3160,7 +3177,9 @@ def _refine_grid_tables(page, tab):
         new_tab = Table(page, flat, bbox=None if was_split else tab._bbox) if flat else tab
         # Build the tagged model on `segment` directly, not on the re-gridded
         # new_tab.cells, so placements match the refined grid.
-        placements, region = _refine_build_placements(page, segment, start)
+        placements, region = _refine_build_placements(
+            page, segment, start, header_regions=header_regions
+        )
         new_tab.placements = placements
         new_tab.header_rows = region.top_header_rows
         new_tab.section_rows = region.section_header_rows
