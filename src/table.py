@@ -2450,6 +2450,12 @@ def make_chars(page, clip=None):
     page_number = page.number + 1
     page_height = page.rect.height
     ctm = page.transformation_matrix
+    native_ctm = pymupdf.JM_matrix_from_py(ctm)
+    # The C rect helper accepts the RAWDICT tuple directly. Its sequence
+    # conversion clamps coordinates, just as it does for a Rect. Keep the
+    # Rect input on the Python fallback, which treats it differently.
+    use_extra = pymupdf.g_use_extra
+    rect_ctm = tuple(ctm) if use_extra else native_ctm
     TEXTPAGE = page.get_textpage(clip=clip, flags=textpage_flags())
     blocks = page.get_text("rawdict", textpage=TEXTPAGE)["blocks"]
     doctop_base = page_height * page.number
@@ -2457,7 +2463,7 @@ def make_chars(page, clip=None):
         for line in block["lines"]:
             ldir = line["dir"]  # = (cosine, sine) of angle
             ldir = (round(ldir[0], 4), round(ldir[1], 4))
-            matrix = pymupdf.Matrix(ldir[0], -ldir[1], ldir[1], ldir[0], 0, 0)
+            line_matrix = (ldir[0], -ldir[1], ldir[1], ldir[0])
             if ldir[1] == 0:
                 upright = True
             else:
@@ -2485,37 +2491,40 @@ def make_chars(page, clip=None):
                 )
                 color = pymupdf.sRGB_to_pdf(span["color"])
                 for char in sorted(span["chars"], key=lambda c: c["bbox"][0]):
-                    bbox = pymupdf.Rect(char["bbox"])
-                    bbox_ctm = bbox * ctm
-                    origin = pymupdf.Point(char["origin"]) * ctm
-                    matrix.e = origin.x
-                    matrix.f = origin.y
+                    bbox = char["bbox"]
+                    x0, top, x1, bottom = bbox
+                    _, y0, _, y1 = pymupdf.util_transform_rect(
+                        bbox if use_extra else pymupdf.Rect(bbox), rect_ctm
+                    )
+                    origin = mupdf.fz_transform_point_xy(*char["origin"], native_ctm)
+                    width = x1 - x0
+                    height = bottom - top
                     text = char["c"]
                     char_dict = {
-                        "adv": bbox.x1 - bbox.x0 if upright else bbox.y1 - bbox.y0,
-                        "bottom": bbox.y1,
-                        "doctop": bbox.y0 + doctop_base,
+                        "adv": width if upright else height,
+                        "bottom": bottom,
+                        "doctop": top + doctop_base,
                         "line_top": char["origin"][1] - line_ascent + doctop_base,
                         "fontname": fontname,
-                        "height": bbox.y1 - bbox.y0,
-                        "matrix": tuple(matrix),
+                        "height": height,
+                        "matrix": (*line_matrix, origin.x, origin.y),
                         "ncs": "DeviceRGB",
                         "non_stroking_color": color,
                         "non_stroking_pattern": None,
                         "object_type": "char",
                         "page_number": page_number,
-                        "size": fontsize if upright else bbox.y1 - bbox.y0,
+                        "size": fontsize if upright else height,
                         "stroking_color": color,
                         "stroking_pattern": None,
                         "bold": span_bold,
                         "text": text,
-                        "top": bbox.y0,
+                        "top": top,
                         "upright": upright,
-                        "width": bbox.x1 - bbox.x0,
-                        "x0": bbox.x0,
-                        "x1": bbox.x1,
-                        "y0": bbox_ctm.y0,
-                        "y1": bbox_ctm.y1,
+                        "width": width,
+                        "x0": x0,
+                        "x1": x1,
+                        "y0": y0,
+                        "y1": y1,
                     }
                     if not upright and ldir[0] == 0:
                         ox = char["origin"][0]
