@@ -196,16 +196,18 @@ def row_vector(texts: list[str]) -> dict[str, float]:
     }
 
 
-def header_candidate_row(row: list[str]) -> bool:
-    features = row_features(row)
+def header_candidate_row(row: list[str], *, features=None) -> bool:
+    if features is None:
+        features = row_features(row)
     if features["nonempty_count"] == 0:
         return False
     short_or_sparse = features["avg_tokens"] <= 6.0 or features["empty_ratio"] >= 0.20
     return bool(short_or_sparse)
 
 
-def grouped_header_scaffold(row: list[str]) -> bool:
-    features = row_features(row)
+def grouped_header_scaffold(row: list[str], *, features=None) -> bool:
+    if features is None:
+        features = row_features(row)
     if features["cell_count"] == 0:
         return False
     texts = [text.strip() for text in row]
@@ -485,18 +487,20 @@ def rowspan_leaf_header_guard(rows: list[list[str]], top_header_rows: int) -> bo
     return body_window_is_stable(body_features)
 
 
-def leading_body_record_like(row: list[str]) -> bool:
-    vector = row_vector(row)
+def leading_body_record_like(row: list[str], *, vector=None) -> bool:
+    if vector is None:
+        vector = row_vector(row)
     if vector["nonempty_count"] < 2:
         return False
     first_is_label = vector["first_label_type"] > 0 and vector["first_value_type"] == 0
     rest_is_values = vector["rest_numeric_ratio"] >= 0.50 or vector["rest_value_type_ratio"] >= 0.50
     value_heavy = vector["numeric_ratio"] >= 0.35 or vector["value_type_ratio"] >= 0.35
-    return bool(first_is_label and rest_is_values and value_heavy and not grouped_header_scaffold(row))
+    return bool(first_is_label and rest_is_values and value_heavy and not grouped_header_scaffold(row, features=vector))
 
 
-def leading_long_form_row_like(row: list[str]) -> bool:
-    vector = row_vector(row)
+def leading_long_form_row_like(row: list[str], *, vector=None) -> bool:
+    if vector is None:
+        vector = row_vector(row)
     return bool(
         vector["nonempty_count"] >= 4
         and vector["long_text_type_ratio"] >= 0.30
@@ -505,10 +509,11 @@ def leading_long_form_row_like(row: list[str]) -> bool:
     )
 
 
-def section_label_row_like(row: list[str]) -> bool:
+def section_label_row_like(row: list[str], *, features=None) -> bool:
     if len(row) < 2:
         return False
-    features = row_features(row)
+    if features is None:
+        features = row_features(row)
     first = column_text(row, 0).strip()
     nonempty = [text for text in row if text.strip()]
     first_only = bool(first and not [text for text in row[1:] if text.strip()])
@@ -572,11 +577,11 @@ def row_profile(row: list[str], index: int) -> dict[str, Any]:
         "body_long_form_row": body_long_form_row,
         "body_like_row": body_value_row or body_dense_row or body_long_form_row,
         "coordinate_header_row": coordinate_header_row,
-        "leading_body_record_row": leading_body_record_like(row),
-        "leading_long_form_row": leading_long_form_row_like(row),
-        "section_label_row": section_label_row_like(row),
-        "grouped_header_scaffold": grouped_header_scaffold(row),
-        "header_candidate": header_candidate_row(row),
+        "leading_body_record_row": leading_body_record_like(row, vector=vector),
+        "leading_long_form_row": leading_long_form_row_like(row, vector=vector),
+        "section_label_row": section_label_row_like(row, features=vector),
+        "grouped_header_scaffold": grouped_header_scaffold(row, features=vector),
+        "header_candidate": header_candidate_row(row, features=vector),
     }
 
 
