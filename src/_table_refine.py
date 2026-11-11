@@ -294,14 +294,15 @@ def _refine_raw_shaded_rects(page, table_rect, *, min_dim):
 
 def _refine_cell_background_rects(raw_rects, *, contain_frac=0.9):
     keep = []
+    areas = [rect.get_area() for rect in raw_rects]
     for index, rect in enumerate(raw_rects):
-        area = rect.get_area()
+        area = areas[index]
         if area <= 0:
             continue
         nested = any(
             other_index != index
+            and areas[other_index] > area * 1.05
             and (rect & other).get_area() >= contain_frac * area
-            and other.get_area() > area * 1.05
             for other_index, other in enumerate(raw_rects)
         )
         if not nested:
