@@ -72,11 +72,13 @@ This is implemented as new class TableHeader with the properties:
 
 """
 
+from bisect import bisect_right
 import inspect
 import itertools
 import string
 import html
 from collections.abc import Sequence
+from functools import cache
 from contextvars import ContextVar
 from dataclasses import dataclass
 from operator import itemgetter
@@ -1529,36 +1531,31 @@ def intersections_to_cells(intersections):
     to the edges that touch the intersection.
     """
 
+    if not intersections:
+        return []
+
+    @cache
+    def edge_boxes(point, orientation):
+        return set(map(obj_to_bbox, intersections[point][orientation]))
+
     def edge_connects(p1, p2) -> bool:
-        def edges_to_set(edges):
-            return set(map(obj_to_bbox, edges))
+        if p1[0] == p2[0] and not edge_boxes(p1, "v").isdisjoint(edge_boxes(p2, "v")):
+            return True
+        return p1[1] == p2[1] and not edge_boxes(p1, "h").isdisjoint(edge_boxes(p2, "h"))
 
-        if p1[0] == p2[0]:
-            common = edges_to_set(intersections[p1]["v"]).intersection(
-                edges_to_set(intersections[p2]["v"])
-            )
-            if len(common):
-                return True
+    points = sorted(intersections)
+    columns = {}
+    rows = {}
+    for pt in points:
+        columns.setdefault(pt[0], []).append(pt)
+        rows.setdefault(pt[1], []).append(pt)
 
-        if p1[1] == p2[1]:
-            common = edges_to_set(intersections[p1]["h"]).intersection(
-                edges_to_set(intersections[p2]["h"])
-            )
-            if len(common):
-                return True
-        return False
-
-    points = list(sorted(intersections.keys()))
-    n_points = len(points)
-
-    def find_smallest_cell(points, i: int):
-        if i == n_points - 1:
-            return None
-        pt = points[i]
-        rest = points[i + 1 :]
-        # Get all the points directly below and directly right
-        below = [x for x in rest if x[0] == pt[0]]
-        right = [x for x in rest if x[1] == pt[1]]
+    def find_smallest_cell(pt):
+        # These lists preserve the order of the original sorted point scan.
+        column = columns[pt[0]]
+        row = rows[pt[1]]
+        below = column[bisect_right(column, pt):]
+        right = row[bisect_right(row, pt):]
         for below_pt in below:
             if not edge_connects(pt, below_pt):
                 continue
@@ -1577,7 +1574,7 @@ def intersections_to_cells(intersections):
                     return (pt[0], pt[1], bottom_right[0], bottom_right[1])
         return None
 
-    cell_gen = (find_smallest_cell(points, i) for i in range(len(points)))
+    cell_gen = (find_smallest_cell(pt) for pt in points)
     return list(filter(None, cell_gen))
 
 
