@@ -28,10 +28,12 @@ analyzer's table grids with the line-based finder's candidates. Table,
 TableFinder and _iou come from pymupdf.table; find_tables is imported lazily.
 """
 
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
+from math import isfinite
 from collections import namedtuple
 
 import pymupdf
+from ._table_text import _table_text_blocks
 
 from pymupdf.table import CHARS, EDGES, Table, TableFinder, _cells_to_rows, _iou
 
@@ -386,7 +388,7 @@ def _union_text_span_rects(page):
     if cached is not None:
         return cached
     spans = []
-    for block in page.get_text("dict").get("blocks", []) or []:
+    for block in _table_text_blocks(page, raw=False):
         for line in block.get("lines", []) or []:
             for span in line.get("spans", []) or []:
                 if not str(span.get("text") or "").strip():
@@ -443,6 +445,11 @@ def _union_span_multiplicity(page, grid):
     if page is None:
         return None
     text_spans = _union_text_span_rects(page)
+    centers = [((float(span.y0) + float(span.y1)) / 2.0, i)
+               for i, span in enumerate(text_spans)]
+    finite_centers = all(isfinite(y) for y, _i in centers)
+    if finite_centers:
+        centers.sort()
     best = None
     for row in grid:
         for cell in row:
@@ -451,7 +458,14 @@ def _union_span_multiplicity(page, grid):
             rect = pymupdf.Rect(cell)
             if rect.is_empty:
                 continue
-            count = _union_cell_span_group_count(rect, text_spans)
+            spans = text_spans
+            y0, y1 = float(rect.y0) - 1.0, float(rect.y1) + 1.0
+            if finite_centers and isfinite(y0) and isfinite(y1):
+                start = bisect_left(centers, (y0, -1))
+                end = bisect_right(centers, (y1, len(text_spans)))
+                # Band clustering is order-sensitive; retain extraction order.
+                spans = [text_spans[i] for i in sorted(i for _y, i in centers[start:end])]
+            count = _union_cell_span_group_count(rect, spans)
             if count > 0:
                 best = count if best is None else max(best, count)
     return float(best) if best is not None else None
