@@ -341,7 +341,10 @@ def _span_text_spans(page):
     if cached is not None:
         return cached
     spans = []
-    for block in page.get_text("dict").get("blocks", []):
+    text_dict = page.get_text(
+        "dict", flags=pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES
+    )
+    for block in text_dict.get("blocks", []):
         for line in block.get("lines", []):
             for span in line.get("spans", []):
                 text = str(span.get("text") or "").strip()
