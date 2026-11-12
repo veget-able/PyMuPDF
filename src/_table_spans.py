@@ -32,6 +32,7 @@ Reuses the word-selection helpers of pymupdf._table_refine.
 """
 
 import pymupdf
+from ._table_text import _table_text_blocks
 
 from pymupdf._table_refine import (
     _refine_is_vertical_or_rotated,
@@ -199,7 +200,7 @@ def _span_vertical_text_lines(page):
     if cached is not None:
         return cached
     lines = []
-    for block in page.get_text("dict").get("blocks", []):
+    for block in _table_text_blocks(page, raw=False):
         if block.get("type") not in (None, 0):
             continue
         for line in block.get("lines", []):
@@ -341,10 +342,7 @@ def _span_text_spans(page):
     if cached is not None:
         return cached
     spans = []
-    text_dict = page.get_text(
-        "dict", flags=pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES
-    )
-    for block in text_dict.get("blocks", []):
+    for block in _table_text_blocks(page, raw=False):
         for line in block.get("lines", []):
             for span in line.get("spans", []):
                 text = str(span.get("text") or "").strip()

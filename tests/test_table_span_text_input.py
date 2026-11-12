@@ -1,5 +1,6 @@
 """Text-only input retains span records, live cache and default image extraction."""
 import unittest
+from unittest.mock import patch
 
 import pymupdf
 from pymupdf._table_spans import _span_text_spans
@@ -13,6 +14,16 @@ class PageInput:
 
 
 class SpanTextTests(unittest.TestCase):
+    def setUp(self):
+        from pymupdf._table_text import _table_text_blocks
+        def blocks(page, *, raw):
+            if isinstance(page, PageInput):
+                return page.get_text('dict', flags=pymupdf.TEXTFLAGS_DICT)['blocks']
+            return _table_text_blocks(page, raw=raw)
+        fixture = patch('pymupdf._table_spans._table_text_blocks', side_effect=blocks)
+        fixture.start()
+        self.addCleanup(fixture.stop)
+
     def test_order_duplicates_filter_and_cache(self):
         page=PageInput({'blocks':[{'type':1,'image':b'ignored'},{'type':0,'lines':[{'spans':[
             {'text':' A ','bbox':[0,0,10,10]}, {'text':' aa ','bbox':[0,0,10,10]},
@@ -22,7 +33,7 @@ class SpanTextTests(unittest.TestCase):
         self.assertEqual([(tuple(rect),text) for rect,text in result],
                          [((0.,0.,10.,10.),'aa'),((0.,0.,10.,10.),'aa'),((10.,0.,20.,10.),'日本語')])
         self.assertIs(_span_text_spans(page),result)
-        self.assertEqual(page.calls,[('dict',{'flags':pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES})])
+        self.assertEqual(page.calls,[('dict',{'flags':pymupdf.TEXTFLAGS_DICT})])
 
     def test_eligible_geometry_errors_propagate(self):
         with self.assertRaises((TypeError,ValueError)):

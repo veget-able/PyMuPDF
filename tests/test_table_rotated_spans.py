@@ -1,5 +1,6 @@
 """The refinement producer retains eligible text, geometry, order and cache."""
 import unittest
+from unittest.mock import patch
 
 import pymupdf
 
@@ -24,6 +25,16 @@ def line(text, direction, wmode=0, bbox=(0, 0, 5, 10)):
 
 
 class RotatedSpanTests(unittest.TestCase):
+    def setUp(self):
+        from pymupdf._table_text import _table_text_blocks
+        def blocks(page, *, raw):
+            if isinstance(page, PageInput):
+                return page.get_text('rawdict', flags=pymupdf.TEXTFLAGS_RAWDICT)['blocks']
+            return _table_text_blocks(page, raw=raw)
+        fixture = patch('pymupdf._table_refine._table_text_blocks', side_effect=blocks)
+        fixture.start()
+        self.addCleanup(fixture.stop)
+
     def test_eligible_spans_keep_text_geometry_and_order(self):
         page = PageInput([line('horizontal', (1, 0)), line(' 縦 ', (0, 1)),
                           line('  ', (0, -1)), line('mode', (1, 0), wmode=1),
@@ -41,7 +52,7 @@ class RotatedSpanTests(unittest.TestCase):
         self.assertEqual(result, [(0., 0., 5., 10., 'vertical'), (20., 1., 25., 5., 'keep')])
         self.assertIs(_refine_page_words(page), result)
         self.assertEqual(page.calls, ['words', 'rawdict'])
-        self.assertEqual(page.options, [{}, {'flags': pymupdf.TEXTFLAGS_RAWDICT & ~pymupdf.TEXT_PRESERVE_IMAGES}])
+        self.assertEqual(page.options, [{}, {'flags': pymupdf.TEXTFLAGS_RAWDICT}])
 
     def test_native_image_and_vertical_text(self):
         with pymupdf.open() as doc:

@@ -36,6 +36,7 @@ import re
 from bisect import bisect_left, bisect_right
 from math import isfinite
 import pymupdf
+from ._table_text import _table_text_blocks
 
 
 # Grid refinement runs three splitters, each taking (page, grid) and returning a
@@ -125,10 +126,7 @@ def _refine_rawdict_spans(page):
     spans need no temporary records. Preserve the eligible spans' original text,
     geometry, metadata and order."""
     spans = []
-    raw = page.get_text(
-        "rawdict", flags=pymupdf.TEXTFLAGS_RAWDICT & ~pymupdf.TEXT_PRESERVE_IMAGES
-    )
-    for block in raw.get("blocks", []):
+    for block in _table_text_blocks(page, raw=True):
         if block.get("type") != 0:
             continue
         for line in block.get("lines", []):

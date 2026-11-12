@@ -21568,8 +21568,6 @@ def JM_make_image_block(block, block_dict):
 
 
 def JM_make_text_block(block, block_dict, raw, buff, tp_rect):
-    if 1 or g_use_extra:
-        return extra.JM_make_text_block(block.m_internal, block_dict, raw, buff.m_internal, tp_rect.m_internal)
     line_list = []
     block_rect = mupdf.FzRect(mupdf.FzRect.Fixed_EMPTY)
     #log(f'{block=}')
