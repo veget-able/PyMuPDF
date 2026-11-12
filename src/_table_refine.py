@@ -119,17 +119,21 @@ def _refine_word_candidates(page, words, rect):
 
 # --- word selection: center-point membership + rotated-span substitution -----
 def _refine_rawdict_spans(page):
-    """Flattened rawdict text spans carrying line-direction metadata.
+    """Vertical/rotated rawdict spans used by _refine_page_words.
 
-    Only used to locate vertical/rotated text so those words can be replaced by
-    span-level bboxes in _refine_page_words. Minimal fields (bbox/text/dir/wmode)
-    -- the only ones the consumers read."""
+    Check line direction before assembling text and coordinates, so horizontal
+    spans need no temporary records. Preserve the eligible spans' original text,
+    geometry, metadata and order."""
     spans = []
-    raw = page.get_text("rawdict")
+    raw = page.get_text(
+        "rawdict", flags=pymupdf.TEXTFLAGS_RAWDICT & ~pymupdf.TEXT_PRESERVE_IMAGES
+    )
     for block in raw.get("blocks", []):
         if block.get("type") != 0:
             continue
         for line in block.get("lines", []):
+            if not _refine_is_vertical_or_rotated(line):
+                continue
             direction = line.get("dir")
             wmode = line.get("wmode")
             for span in line.get("spans", []):
@@ -179,11 +183,7 @@ def _refine_page_words(page):
         for w in page.get_text("words")
         if str(w[4]).strip()
     ]
-    rotated_spans = [
-        span
-        for span in _refine_rawdict_spans(page)
-        if _refine_is_vertical_or_rotated(span) and str(span.get("text") or "").strip()
-    ]
+    rotated_spans = _refine_rawdict_spans(page)
     if rotated_spans:
         rotated_rects = [pymupdf.Rect(span.get("bbox") or []) for span in rotated_spans]
         kept = []
