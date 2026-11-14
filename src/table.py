@@ -3054,7 +3054,7 @@ def _refine_repeated_leading_header_cuts(rows, header_rows):
 
     Several tables printed one under another with no gap are detected as one
     grid, and the giveaway is that their shared header row recurs verbatim. The
-    signature is the first row that carries at least two non-empty cells in a
+    signature is the first row that carries at least two distinct non-empty labels in a
     grid at least two columns wide and is not purely numeric or punctuation; it
     must also be a leading row -- inside the header region the header rules found,
     or within the first three rows, because that finder is conservative and a
@@ -3093,6 +3093,8 @@ def _refine_repeated_leading_header_cuts(rows, header_rows):
         nonempty = [text for text in signature if text]
         if len(nonempty) < 2:
             continue
+        if len(set(nonempty)) < 2:
+            continue  # one repeated marker does not identify distinct columns
         if not any(char.isalpha() for text in nonempty for char in text):
             continue  # a repeated all-numeric row is data, not a header
         repeats = [
@@ -3145,15 +3147,24 @@ def _refine_grid_tables(page, tab):
     model_grid, header_rows, body_start = _refine_model_grid(
         page, working, header_regions=header_regions
     )
+    section_titles = ()
     if model_grid is None:
         body_start = 1
         cuts = ()
     else:
         # The model grid has one row per row of `working`, so its cut indices
         # index `working` directly.
-        cuts = _refine_repeated_leading_header_cuts(
-            _refine_placements_text_grid(model_grid), header_rows
-        )
+        rows = _refine_placements_text_grid(model_grid)
+        cuts = _refine_repeated_leading_header_cuts(rows, header_rows)
+        if cuts:
+            from ._table_sections import section_repeat_plan
+
+            cuts, section_titles = section_repeat_plan(
+                page, model_grid, rows, header_rows, cuts, CHARS._list(),
+                width=_refine_placement_grid_width(model_grid),
+                is_line_like=_is_line_like,
+                min_length=TableSettings().edge_min_length,
+            )
     if cuts:
         boundaries = (0, *cuts, len(working))
         segments = [working[start:end] for start, end in zip(boundaries, boundaries[1:])]
@@ -3180,6 +3191,13 @@ def _refine_grid_tables(page, tab):
         placements, region = _refine_build_placements(
             page, segment, start, header_regions=header_regions
         )
+        if section_titles:
+            from ._table_sections import apply_section_title
+
+            placements = apply_section_title(
+                page, placements, section_titles,
+                width=_refine_placement_grid_width(placements),
+            )
         new_tab.placements = placements
         new_tab.header_rows = region.top_header_rows
         new_tab.section_rows = region.section_header_rows

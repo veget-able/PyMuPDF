@@ -1,0 +1,36 @@
+중앙 섹션 제목 및 반복헤더 표 분리 / 2026-11-14
+
+반영 기능
+- 반복 헤더의 열 이름을 정규화한 뒤 서로 다른 비어 있지 않은 라벨 2종 이상 요구. 동일한 생략 표식의 반복으로 비교표를 분리하는 경로 방지.
+- 각 반복 블록 앞에 실제 단독 bold 섹션 제목이 있고 본문이 이어지면, 실제 단어 bbox의 중앙 정렬과 원문 소속을 확인해 제목 행에서 표 분리.
+- 중앙 기준은 전체 행 폭의 5%이며 기존 구간 중앙 판정에서 재사용. 파일명·GT·학습 사례 문자열을 판정에 사용하지 않음.
+- 내부 native 세로 구획·다른 실제 단어·rowspan 교차·불완전 열·불명확 자료는 제목 범위 확장 거부.
+- 최종 strict placement가 동일한 제목·행 영역·실제 단어 집합을 유지하면 제목 bbox를 전폭으로 확장하고 논리 열 수와 같은 colspan 생성. 제목 원문 속성 및 본문 셀 유지.
+- _table_sections.py는 입력 자료를 전달받는 내부 helper이며 모델·PDF 추출 실행 없음. 기존 문자·단어·도형 캐시 및 _WordCenterIndex 재사용.
+- table.py의 refine 경로에 직접 배선, HTML 문자열 후편집 없음. setup.py wheel 파일 목록에 신규 모듈 포함. 기본 refine=False 경로 유지.
+
+호환 구성
+- 적용 브랜치: table-experiements/cnn4gnn-pymupdf-2.0-html-20261110.
+- pymupdf4llm dc96e6f78c37f1b3130000d652835ffcca497a75, CNN source 5b80a0c43409701ee3c8c0b054d606f1d0404aa0 유지.
+- CNN Stage1·Stage2 + V5, OCR OFF, 기존 MuPDF1.28.5 native 및 모델 파일 유지.
+
+검증 결과
+- PyMuPDF 표 관련 집중 unittest 40개 통과. 기존 실험의 79계약 및 기존 H6 전폭 oracle53조건도 별도 근거 보존.
+- 제품 직접 경로 PB503·DP200·Local998·newold11 총1,712페이지 실행 및 채점된 격리 출력의 공개 JSON 값·모델 호출 수 일치 검증.
+- PB IoU0.60 bbox F1 81.675978% → 82.122905%, GTRM76.260692% → 76.295571%. GTRM1상승·1하락.
+- CA1220은 제목6개 colspan11, 페이지 GTRM82.289886% → 100%, bbox TP2/FP4/FN4 → TP6/FP0/FN0.
+- DP200 결과 동일. Local bbox F1 74.633373% 동일, GTRM67.783617% → 67.782406%, 1페이지 하락.
+- 남은 회귀: blackrock-funds-i-icav-annual-report-2022_page13 GTRM -0.165899pp, pubtables-608dbe1bd8c8867e -1.201303pp. 후자의 CON 상승·TRM 하락과 전자의 최종 strict 제목 분절을 구분.
+- 위 회귀를 기록한 후보에 대해 사용자 제품 반영·Viewer 게시·commit/push 승인에 따라 적용.
+- 활성3대표 중 2페이지의 정책 계산 평균 약1.4~2.0ms, 추가 모델/PDF 추출 호출0. E2E 표본은 증감 혼재하여 전체 처리량 개선 주장 없음.
+
+변경 위치
+- src/table.py: 반복 라벨 자격, 섹션 제목 절단 계획 및 최종 placement 소비.
+- src/_table_sections.py: 중앙·물리 구획·원문·slot 계약 및 제목 셀 생성.
+- setup.py: wheel 모듈 포함.
+- tests/test_table_section_titles.py: 독립 집중 계약.
+
+실행 증거
+- /mnt/hdd1/experiments/pb_table/laura/20261114-section-title-product/full-complete.json 및 full-observations.jsonl.
+- /mnt/hdd1/experiments/pb_table/laura/20261114-centered-section-span-final/의 점수·페이지별 손익·출력·시간 원장.
+- 상세 분석: pb_table/docs/experiments/centered-section-title-colspan-20261114.txt.
