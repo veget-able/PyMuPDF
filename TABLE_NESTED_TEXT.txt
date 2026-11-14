@@ -1,0 +1,25 @@
+중첩 괘선 표의 평문 보존 / 2026-11-14
+
+반영 기능
+- 실제 채택된 괘선 표의 한 셀 안에 완전히 포함된 내부 격자를 독립 표 후보·출력에서 제외.
+- 내부 내용은 기존 부모 표 셀의 평문으로 유지. 표 밖 Text 박스 생성이나 별도 텍스트 복원 없음.
+- 승인된 grid-ref 부모의 내부 후보가 부모를 대체하지 않도록 보호하고, 최종 선택된 native 부모/자식 관계에서 중복 표 제거.
+- 부모가 거절되거나 선택되지 않으면 자식 후보 유지. 단순 GNN bbox 포함·부분 겹침·여러 부모 셀을 가로지르는 표·None gap·동일 bbox는 중첩으로 제외하지 않음.
+- 기존 후보 bbox·실제 셀 격자·grid-ref 소비 집합 재사용. 신규 geometry helper1개를 두 소비 지점에서 사용.
+- 기존 grid-ref/span gate와 일반 find_tables(union=False) 동작 유지. 모델·OCR·PDF 재추출 호출 추가 없음.
+
+검증
+- PB503·DP200·Local998·newold11 총1,712 실제 API 성공, 신규 오류0·모델 호출 수 동일.
+- newold5: 외부5행3열 구조 유지, 독립 표5개 → 1개. 105 출력8회 → 원문과 같은4회.
+- PB CA2884: 부모 표 내용 유지하면서 내부1행9열 중복 표1개 제외.
+- PB bbox IoU0.60 F1 82.122905% → 82.168809%, TP735/FN158 유지·FP162→161. GTRM76.295571% 유지.
+- DP200·Local998 출력 및 점수 동일. 이번 변경에 따른 추가 점수 회귀0이며 이전 기능의 기존 회귀 해소를 의미하지 않음.
+- 남는 표의 bbox·행열·cells·HTML 동일. 제외된 내부표5개의 원문 토큰 합계가 부모에 보존, 표 밖 텍스트 토큰·순서 동일.
+- 독립 패널·거절 부모·교차 셀·정상 grid-ref 등18집중계약 및 표 unittest47개 통과.
+- 별도 DL/VG/CF/SF 신규 채점 미실행. 두 대표 API 시간은 증감 혼재하여 전수 처리량 개선 주장 없음.
+
+구현
+- src/_table_union.py: _union_nested_candidate_indexes 및 _union_replace_append의 승인/선택 경계.
+- tests/test_table_nested_candidates.py: 독립 geometry·선택 계약.
+- 호환 구성: 기존 CNN Stage1·Stage2 + V5 브랜치, pymupdf4llm dc96e6f78c37f1b3130000d652835ffcca497a75 유지.
+- 상세 원장: /mnt/hdd1/experiments/pb_table/laura/20261114-nested-table-candidates/.
