@@ -13670,6 +13670,18 @@ class Page:
             del tp
         return rlist
 
+    def search_for_fuzzy(self, needle, *, max_edits, clip=None, textpage=None) -> list:
+        """Find approximate text occurrences with their edit distance and quads.
+
+        `max_edits` bounds insertions, deletions and substitutions after Unicode
+        case-folding, whitespace folding and line-end dehyphenation. Each result
+        is a dict with `text`, `distance` and `quads`. See the API documentation
+        for overlap selection and text extraction limitations.
+        """
+        from ._textsearch import search_for_fuzzy
+        return search_for_fuzzy(self, needle, max_edits=max_edits,
+                                clip=clip, textpage=textpage)
+
     def set_artbox(self, rect):
         """Set the ArtBox."""
         return self._set_pagebox("ArtBox", rect)
