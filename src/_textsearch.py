@@ -1,33 +1,34 @@
 """Approximate substring search, with offsets into the extracted page text."""
 
-from itertools import groupby
+from bisect import bisect_right
+import re
 
 
 def _normalize(text):
     """Case-fold and collapse whitespace, retaining original character ranges."""
-    chars, offsets = [], []
-    i = 0
-    while i < len(text):
-        # Join a word split across consecutive lines, but not across blocks
-        # (which are separated by two newlines). Keep the original hyphen in
-        # the returned text and geometry.
-        if (text[i:i + 2] == "-\n" and i and text[i - 1].isalpha()
-                and i + 2 < len(text) and text[i + 2].isalpha()):
-            i += 2
-            continue
-        char = text[i]
-        if char.isspace():
-            if chars and chars[-1] == " ":
-                offsets[-1] = (offsets[-1][0], i + 1)
-            else:
-                chars.append(" ")
-                offsets.append((i, i + 1))
+    parts, offsets = [], []
+    for match in re.finditer(r"\s+|\S+", text):
+        start, end = match.span()
+        token = match.group()
+        if token.isspace():
+            # Join only a single line break between letters, retaining the
+            # original hyphen and newline through the surrounding offsets.
+            if (token == "\n" and start >= 2 and text[start - 1] == "-"
+                    and text[start - 2].isalpha() and end < len(text)
+                    and text[end].isalpha()):
+                parts[-1] = parts[-1][:-1]
+                offsets.pop()
+                continue
+            parts.append(" ")
+            offsets.append((start, end))
         else:
-            folded = char.casefold()
-            chars.extend(folded)
-            offsets.extend([(i, i + 1)] * len(folded))
-        i += 1
-    return "".join(chars), offsets
+            parts.append(token.casefold())
+            if token.isascii():
+                offsets.extend(zip(range(start, end), range(start + 1, end + 1)))
+            else:
+                for i, char in enumerate(token, start):
+                    offsets.extend([(i, i + 1)] * len(char.casefold()))
+    return "".join(parts), offsets
 
 
 def _windows(text, needle, max_edits):
@@ -80,16 +81,30 @@ def _levenshtein(text, needle, max_edits, boundaries):
     """
     size = len(needle)
     previous = list(range(size + 1))
+    active = list(range(max_edits + 1))
     if boundaries is not None and not boundaries[0]:
-        previous = [size + 1] * (size + 1)
+        previous = [max_edits + 1] * (size + 1)
+        active = []
     starts = [0] * (size + 1)
+    dense = False
     for end, char in enumerate(text, 1):
-        current = [0] * (size + 1)
         boundary = boundaries is None or boundaries[end]
-        if not boundary:
-            current[0] = size + 1  # Do not start inside a case-folded glyph.
+        current = [max_edits + 1] * (size + 1)
         current_starts = [end] * (size + 1)
-        for i, wanted in enumerate(needle, 1):
+        current[0] = 0 if boundary else max_edits + 1
+        # An over-budget state cannot lead to an in-budget alignment. Visit
+        # only active states, successors and deletions from a new start.
+        # Once states become dense, avoid bookkeeping for the rest of this
+        # window (important for repeated characters or large edit budgets).
+        if dense or len(active) > size // 3:
+            dense = True
+            columns = enumerate(needle, 1)
+        else:
+            columns = sorted(set(active) | {i + 1 for i in active if i < size}
+                             | set(range(1, max_edits + 1) if boundary else ()))
+            columns = ((i, needle[i - 1]) for i in columns if i)
+        next_active = [0] if boundary else []
+        for i, wanted in columns:
             cost = previous[i - 1] + (char != wanted)
             start = starts[i - 1]
             insertion = previous[i] + 1
@@ -99,30 +114,34 @@ def _levenshtein(text, needle, max_edits, boundaries):
             if deletion < cost or (deletion == cost and current_starts[i - 1] < start):
                 cost, start = deletion, current_starts[i - 1]
             current[i], current_starts[i] = cost, start
+            if not dense and cost <= max_edits:
+                next_active.append(i)
         if boundary and current[-1] <= max_edits and current_starts[-1] < end:
             yield current[-1], current_starts[-1], end
-        previous, starts = current, current_starts
+        previous, starts, active = current, current_starts, next_active
 
 
 def _page_text(raw):
-    """Return text, per-character (span, char) references, and original spans."""
-    text, refs, spans = [], [], []
+    """Return text and span ranges; RAWDICT already stores individual chars."""
+    text, spans = [], []
+    offset = 0
     for block in raw["blocks"]:
         if block["type"] != 0:
             continue
         if text:
             text.append("\n")
-            refs.append(None)
+            offset += 1
         for line in block["lines"]:
             for span in line["spans"]:
-                span_index = len(spans)
-                spans.append((line["dir"], span))
-                for char_index, char in enumerate(span["chars"]):
-                    text.extend(char["c"])
-                    refs.extend([(span_index, char_index)] * len(char["c"]))
+                # Each RAWDICT char holds one Unicode code point, including
+                # preserved ligatures. Store one range per span, not per char.
+                value = "".join(char["c"] for char in span["chars"])
+                text.append(value)
+                spans.append((offset, offset + len(value), line["dir"], span))
+                offset += len(value)
             text.append("\n")
-            refs.append(None)
-    return "".join(text), refs, spans
+            offset += 1
+    return "".join(text), spans
 
 
 def search_for_fuzzy(page, needle, *, max_edits, clip=None, textpage=None):
@@ -150,7 +169,7 @@ def search_for_fuzzy(page, needle, *, max_edits, clip=None, textpage=None):
     elif getattr(textpage, "parent", None) != page:
         raise ValueError("not a textpage of this page")
 
-    original, refs, spans = _page_text(textpage.extractRAWDICT())
+    original, spans = _page_text(textpage.extractRAWDICT())
     text, offsets = _normalize(original)
     boundaries = [True] + [a[0] != b[0] for a, b in zip(offsets, offsets[1:])] + [True]
     candidates = sorted(_candidates(text, needle, max_edits, boundaries),
@@ -170,13 +189,14 @@ def search_for_fuzzy(page, needle, *, max_edits, clip=None, textpage=None):
     results = []
     for first, last, distance in sorted(selected):
         quads = []
-        for span_index, group in groupby(refs[first:last],
-                                        key=lambda ref: ref[0] if ref else None):
-            if span_index is None:
-                continue
-            chars = list(group)
-            direction, span = spans[span_index]
-            quads.append(recover_span_quad(direction, span,
-                         span["chars"][chars[0][1]:chars[-1][1] + 1]))
+        index = bisect_right(spans, first, key=lambda item: item[1])
+        while index < len(spans):
+            start, end, direction, span = spans[index]
+            if start >= last:
+                break
+            chars = span["chars"][max(0, first - start):last - start]
+            if chars:
+                quads.append(recover_span_quad(direction, span, chars))
+            index += 1
         results.append(dict(text=original[first:last], distance=distance, quads=quads))
     return results

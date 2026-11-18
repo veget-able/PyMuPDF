@@ -30,6 +30,9 @@ def test_candidates_against_exhaustive_substrings():
     cases = list(itertools.product(strings, strings[1:15]))
     cases += [("".join(rng.choices("ab cß가", k=16)),
                "".join(rng.choices("ab cß가", k=6))) for _ in range(100)]
+    for _ in range(10):
+        needle = "".join(rng.choices("abcdefghijklmnopqrstuvwxyz", k=12))
+        cases.append(("xx" + needle[:5] + "#" + needle[6:] + "yy", needle))
     for text, needle in cases:
         for limit in range(min(len(needle), 3)):
             expected = []
@@ -63,6 +66,34 @@ def test_candidate_windows_preserve_full_scan_results():
         boundaries = [True] + [rng.randrange(5) != 0 for _ in text[:-1]] + [True]
         assert list(_candidates(text, needle, limit, boundaries)) == list(
             _levenshtein(text, needle, limit, boundaries))
+
+
+@pytest.mark.parametrize("text,normalized,offsets", [
+    (" A \t B ", " a b ", [(0, 1), (1, 2), (2, 5), (5, 6), (6, 7)]),
+    ("a-\nb", "ab", [(0, 1), (3, 4)]),
+    ("a-\n\nb", "a- b", [(0, 1), (1, 2), (2, 4), (4, 5)]),
+    ("ßﬂ İ", "ssfl i\u0307", [(0, 1)] * 2 + [(1, 2)] * 2 + [(2, 3)] + [(3, 4)] * 2),
+    ("\u00a0A\u2002", " a ", [(0, 1), (1, 2), (2, 3)]),
+])
+def test_normalized_character_ranges(text, normalized, offsets):
+    assert _normalize(text) == (normalized, offsets)
+
+
+@pytest.mark.parametrize("needle,fragments", [("target", ["tar", "get"]),
+                                              ("tar", ["tar"]), ("get", ["get"])])
+def test_match_across_span_boundaries(needle, fragments):
+    with pymupdf.open() as doc:
+        page = doc.new_page()
+        page.insert_text((30, 60), "prefix tar", fontsize=12)
+        x = 30 + pymupdf.get_text_length("prefix tar", fontsize=12)
+        page.insert_text((x, 60), "get suffix", fontname="hebo", fontsize=12)
+        hits = page.search_for_fuzzy(needle, max_edits=0)
+        assert len(hits) == 1
+        assert hits[0]["text"] == needle
+        assert len(hits[0]["quads"]) == len(fragments)
+        for quad, fragment in zip(hits[0]["quads"], fragments):
+            expected = page.search_for(fragment, quads=True)[0]
+            assert max(abs(a - b) for a, b in zip(quad, expected)) < 0.001
 
 
 @pytest.mark.parametrize("needle,text,distance", [
