@@ -9,6 +9,12 @@ import pytest
 from pymupdf._textsearch import _candidates, _levenshtein, _normalize
 
 
+@pytest.fixture
+def page():
+    with pymupdf.open() as doc:
+        yield doc.new_page()
+
+
 def _distance(left, right):
     # Deliberately use a full matrix, independently of the substring matcher.
     matrix = [[0] * (len(right) + 1) for _ in range(len(left) + 1)]
@@ -81,19 +87,17 @@ def test_normalized_character_ranges(text, normalized, offsets):
 
 @pytest.mark.parametrize("needle,fragments", [("target", ["tar", "get"]),
                                               ("tar", ["tar"]), ("get", ["get"])])
-def test_match_across_span_boundaries(needle, fragments):
-    with pymupdf.open() as doc:
-        page = doc.new_page()
-        page.insert_text((30, 60), "prefix tar", fontsize=12)
-        x = 30 + pymupdf.get_text_length("prefix tar", fontsize=12)
-        page.insert_text((x, 60), "get suffix", fontname="hebo", fontsize=12)
-        hits = page.search_for_fuzzy(needle, max_edits=0)
-        assert len(hits) == 1
-        assert hits[0]["text"] == needle
-        assert len(hits[0]["quads"]) == len(fragments)
-        for quad, fragment in zip(hits[0]["quads"], fragments):
-            expected = page.search_for(fragment, quads=True)[0]
-            assert max(abs(a - b) for a, b in zip(quad, expected)) < 0.001
+def test_match_across_span_boundaries(page, needle, fragments):
+    page.insert_text((30, 60), "prefix tar", fontsize=12)
+    x = 30 + pymupdf.get_text_length("prefix tar", fontsize=12)
+    page.insert_text((x, 60), "get suffix", fontname="hebo", fontsize=12)
+    hits = page.search_for_fuzzy(needle, max_edits=0)
+    assert len(hits) == 1
+    assert hits[0]["text"] == needle
+    assert len(hits[0]["quads"]) == len(fragments)
+    for quad, fragment in zip(hits[0]["quads"], fragments):
+        expected = page.search_for(fragment, quads=True)[0]
+        assert max(abs(a - b) for a, b in zip(quad, expected)) < 0.001
 
 
 @pytest.mark.parametrize("needle,text,distance", [
@@ -105,65 +109,53 @@ def test_match_across_span_boundaries(needle, fragments):
     ("the rate was 1.2 today", "the rate was 12 today", 1),
     ("the fund is not safe", "the fund is now safe", 1),
 ])
-def test_edits(needle, text, distance):
-    with pymupdf.open() as doc:
-        page = doc.new_page()
-        page.insert_text((30, 60), text)
-        hits = page.search_for_fuzzy(needle, max_edits=distance)
-        assert len(hits) == 1
-        assert hits[0]["text"] == text
-        assert hits[0]["distance"] == distance
-        assert len(hits[0]["quads"]) == 1
-        assert _distance(_normalize(text)[0], _normalize(needle)[0]) == distance
+def test_edits(page, needle, text, distance):
+    page.insert_text((30, 60), text)
+    hits = page.search_for_fuzzy(needle, max_edits=distance)
+    assert len(hits) == 1
+    assert hits[0]["text"] == text
+    assert hits[0]["distance"] == distance
+    assert len(hits[0]["quads"]) == 1
+    assert _distance(_normalize(text)[0], _normalize(needle)[0]) == distance
 
 
-def test_repeated_and_exact_and_fuzzy():
-    with pymupdf.open() as doc:
-        page = doc.new_page()
-        page.insert_text((30, 60), "cot | cat | cot | catcat")
-        hits = page.search_for_fuzzy("cat", max_edits=1)
-        assert [h["text"] for h in hits] == ["cot", "cat", "cot", "cat", "cat"]
-        assert [h["distance"] for h in hits] == [1, 0, 1, 0, 0]
-        assert page.search_for_fuzzy("unrelated", max_edits=2) == []
+def test_repeated_and_exact_and_fuzzy(page):
+    page.insert_text((30, 60), "cot | cat | cot | catcat")
+    hits = page.search_for_fuzzy("cat", max_edits=1)
+    assert [h["text"] for h in hits] == ["cot", "cat", "cot", "cat", "cat"]
+    assert [h["distance"] for h in hits] == [1, 0, 1, 0, 0]
+    assert page.search_for_fuzzy("unrelated", max_edits=2) == []
 
 
-def test_overlapping_occurrences():
-    with pymupdf.open() as doc:
-        page = doc.new_page()
-        page.insert_text((30, 60), "bananana")
-        hits = page.search_for_fuzzy("ana", max_edits=0)
-        assert [h["text"] for h in hits] == ["ana", "ana"]
-        assert hits[0]["quads"][0].rect.x1 <= hits[1]["quads"][0].rect.x0
+def test_overlapping_occurrences(page):
+    page.insert_text((30, 60), "bananana")
+    hits = page.search_for_fuzzy("ana", max_edits=0)
+    assert [h["text"] for h in hits] == ["ana", "ana"]
+    assert hits[0]["quads"][0].rect.x1 <= hits[1]["quads"][0].rect.x0
 
 
-def test_equal_distance_prefers_closest_length():
-    with pymupdf.open() as doc:
-        page = doc.new_page()
-        page.insert_text((30, 60), "revenue increased")
-        hits = page.search_for_fuzzy("revenue increasd", max_edits=1)
-        # Both the whole word and its prefix have distance one. This is a
-        # substring API, so it does not add a word-completion heuristic.
-        assert [(h["text"], h["distance"]) for h in hits] == [("revenue increase", 1)]
+def test_equal_distance_prefers_closest_length(page):
+    page.insert_text((30, 60), "revenue increased")
+    hits = page.search_for_fuzzy("revenue increasd", max_edits=1)
+    # Both the whole word and its prefix have distance one. This is a
+    # substring API, so it does not add a word-completion heuristic.
+    assert [(h["text"], h["distance"]) for h in hits] == [("revenue increase", 1)]
 
 
-def test_casefold_glyph_boundaries():
-    with pymupdf.open() as doc:
-        page = doc.new_page()
-        page.insert_text((30, 60), "ß")
-        assert page.search_for_fuzzy("s", max_edits=0) == []
-        hits = page.search_for_fuzzy("sa", max_edits=1)
-        assert [(h["text"], h["distance"]) for h in hits] == [("ß", 1)]
+def test_casefold_glyph_boundaries(page):
+    page.insert_text((30, 60), "ß")
+    assert page.search_for_fuzzy("s", max_edits=0) == []
+    hits = page.search_for_fuzzy("sa", max_edits=1)
+    assert [(h["text"], h["distance"]) for h in hits] == [("ß", 1)]
 
 
-def test_dehyphenated_textpage():
-    with pymupdf.open() as doc:
-        page = doc.new_page()
-        page.insert_text((30, 60), "meth-\nod")
-        tp = page.get_textpage(flags=pymupdf.TEXTFLAGS_SEARCH)
-        hits = page.search_for_fuzzy("method", max_edits=0, textpage=tp)
-        assert len(hits) == 1
-        assert hits[0]["text"] == "meth-\nod"
-        assert len(hits[0]["quads"]) == 2
+def test_dehyphenated_textpage(page):
+    page.insert_text((30, 60), "meth-\nod")
+    tp = page.get_textpage(flags=pymupdf.TEXTFLAGS_SEARCH)
+    hits = page.search_for_fuzzy("method", max_edits=0, textpage=tp)
+    assert len(hits) == 1
+    assert hits[0]["text"] == "meth-\nod"
+    assert len(hits[0]["quads"]) == 2
 
 
 @pytest.mark.parametrize("text,needle,expected", [
@@ -171,34 +163,28 @@ def test_dehyphenated_textpage():
     ("A meth-\nod works", "method", "meth-\nod"),
     ("Straße", "STRASSE", "Straße"),
 ])
-def test_normalization(text, needle, expected):
-    with pymupdf.open() as doc:
-        page = doc.new_page()
-        page.insert_text((30, 60), text)
-        hits = page.search_for_fuzzy(needle, max_edits=0)
-        assert len(hits) == 1
-        assert hits[0]["text"] == expected
-        assert hits[0]["distance"] == 0
-        assert len(hits[0]["quads"]) == (2 if "\n" in expected else 1)
+def test_normalization(page, text, needle, expected):
+    page.insert_text((30, 60), text)
+    hits = page.search_for_fuzzy(needle, max_edits=0)
+    assert len(hits) == 1
+    assert hits[0]["text"] == expected
+    assert hits[0]["distance"] == 0
+    assert len(hits[0]["quads"]) == (2 if "\n" in expected else 1)
 
 
-def test_hyphens_at_block_boundaries():
-    with pymupdf.open() as doc:
-        page = doc.new_page()
-        page.insert_text((30, 60), "meth-")
-        page.insert_text((30, 200), "od")
-        assert page.search_for_fuzzy("method", max_edits=0) == []
-        assert _normalize("-5% 1.2 10-20 well-being")[0] == "-5% 1.2 10-20 well-being"
+def test_hyphens_at_block_boundaries(page):
+    page.insert_text((30, 60), "meth-")
+    page.insert_text((30, 200), "od")
+    assert page.search_for_fuzzy("method", max_edits=0) == []
+    assert _normalize("-5% 1.2 10-20 well-being")[0] == "-5% 1.2 10-20 well-being"
 
 
-def test_cjk():
-    with pymupdf.open() as doc:
-        page = doc.new_page()
-        page.insert_text((30, 60), "매출증가했습니다", fontname="korea")
-        hits = page.search_for_fuzzy("매출증가했슴니다", max_edits=1)
-        assert len(hits) == 1
-        assert hits[0]["text"] == "매출증가했습니다"
-        assert hits[0]["distance"] == 1
+def test_cjk(page):
+    page.insert_text((30, 60), "매출증가했습니다", fontname="korea")
+    hits = page.search_for_fuzzy("매출증가했슴니다", max_edits=1)
+    assert len(hits) == 1
+    assert hits[0]["text"] == "매출증가했습니다"
+    assert hits[0]["distance"] == 1
 
 
 def test_ligatures():
@@ -210,46 +196,40 @@ def test_ligatures():
 
 
 @pytest.mark.parametrize("needle", ["", " \n\t"])
-def test_empty_needle(needle):
-    with pymupdf.open() as doc:
-        assert doc.new_page().search_for_fuzzy(needle, max_edits=2) == []
+def test_empty_needle(page, needle):
+    assert page.search_for_fuzzy(needle, max_edits=2) == []
 
 
 @pytest.mark.parametrize("limit,error", [(True, TypeError), (1.0, TypeError),
                                          ("1", TypeError), (-1, ValueError), (3, ValueError)])
-def test_invalid_budget(limit, error):
-    with pymupdf.open() as doc:
-        with pytest.raises(error):
-            doc.new_page().search_for_fuzzy("cat", max_edits=limit)
+def test_invalid_budget(page, limit, error):
+    with pytest.raises(error):
+        page.search_for_fuzzy("cat", max_edits=limit)
 
 
-def test_empty_page_and_invalid_needle():
-    with pymupdf.open() as doc:
-        page = doc.new_page()
-        assert page.search_for_fuzzy("cat", max_edits=1) == []
-        with pytest.raises(TypeError):
-            page.search_for_fuzzy(None, max_edits=1)
-        with pytest.raises(TypeError):
-            page.search_for_fuzzy("cat")
+def test_empty_page_and_invalid_needle(page):
+    assert page.search_for_fuzzy("cat", max_edits=1) == []
+    with pytest.raises(TypeError):
+        page.search_for_fuzzy(None, max_edits=1)
+    with pytest.raises(TypeError):
+        page.search_for_fuzzy("cat")
 
 
-def test_clip_and_textpage():
-    with pymupdf.open() as doc:
-        page = doc.new_page()
-        page.insert_text((30, 60), "prefix target suffix")
-        page.insert_text((30, 160), "prefix target suffix")
-        clip = pymupdf.Rect(0, 0, 300, 100)
-        direct = page.search_for_fuzzy("target", max_edits=1, clip=clip)
-        assert len(direct) == 1
-        tp = page.get_textpage(clip=clip)
-        reused = page.search_for_fuzzy("target", max_edits=1, textpage=tp,
-                                       clip=pymupdf.Rect(0, 200, 10, 210))
-        assert reused == direct
-        assert page.get_textbox(direct[0]["quads"][0].rect) == "target"
-        with pymupdf.open() as other:
-            other_page = other.new_page()
-            with pytest.raises(ValueError, match="not a textpage"):
-                page.search_for_fuzzy("target", max_edits=1, textpage=other_page.get_textpage())
+def test_clip_and_textpage(page):
+    page.insert_text((30, 60), "prefix target suffix")
+    page.insert_text((30, 160), "prefix target suffix")
+    clip = pymupdf.Rect(0, 0, 300, 100)
+    direct = page.search_for_fuzzy("target", max_edits=1, clip=clip)
+    assert len(direct) == 1
+    tp = page.get_textpage(clip=clip)
+    reused = page.search_for_fuzzy("target", max_edits=1, textpage=tp,
+                                   clip=pymupdf.Rect(0, 200, 10, 210))
+    assert reused == direct
+    assert page.get_textbox(direct[0]["quads"][0].rect) == "target"
+    with pymupdf.open() as other:
+        other_page = other.new_page()
+        with pytest.raises(ValueError, match="not a textpage"):
+            page.search_for_fuzzy("target", max_edits=1, textpage=other_page.get_textpage())
 
 
 @pytest.mark.parametrize("rotation", [0, 90, 180, 270])
